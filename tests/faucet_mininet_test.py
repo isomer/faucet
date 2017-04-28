@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 """Mininet tests for FAUCET.
 
@@ -25,6 +25,7 @@
  * ladvd
 """
 
+import collections
 import glob
 import inspect
 import os
@@ -32,13 +33,17 @@ import sys
 import getopt
 import random
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
 
-import ipaddr
+from SimpleHTTPServer import SimpleHTTPRequestHandler
+from BaseHTTPServer import HTTPServer
+
+import ipaddress
 import yaml
 
 from concurrencytest import ConcurrentTestSuite, fork_for_tests
@@ -65,6 +70,7 @@ EXTERNAL_DEPENDENCIES = (
      r'tcpdump\s+version\s+(\d+\.\d+)\.\d+\n', "4.5"),
     ('nc', [], 'nc from the netcat-openbsd', '', 0),
     ('vconfig', [], 'the VLAN you are talking about', '', 0),
+    ('2to3', ['--help'], 'Usage: 2to3', '', 0),
     ('fuser', ['-V'], r'fuser \(PSmisc\)',
      r'fuser \(PSmisc\) (\d+\.\d+)\n', "22.0"),
     ('mn', ['--version'], r'\d+\.\d+.\d+',
@@ -77,12 +83,16 @@ EXTERNAL_DEPENDENCIES = (
      r'pylint (\d+\.\d+).\d+,', "1.6"),
     ('curl', ['--version'], 'libcurl',
      r'curl (\d+\.\d+).\d+', "7.3"),
-    ('ladvd', ['-v'], 'ladvd',
+    ('ladvd', ['-h'], 'ladvd',
      r'ladvd version (\d+\.\d+)\.\d+', "1.1"),
 )
 
 # Must pass with 0 lint errors
-FAUCET_LINT_SRCS = glob.glob(os.path.join(faucet_mininet_test_util.FAUCET_DIR, '*py'))
+FAUCET_LINT_SRCS = glob.glob(
+    os.path.join(faucet_mininet_test_util.FAUCET_DIR, '*py'))
+FAUCET_TEST_LINT_SRCS = [
+    os.path.join(os.path.dirname(__file__), 'faucet_mininet_test.py'),
+    os.path.join(os.path.dirname(__file__), 'faucet_mininet_test_base.py')]
 
 # Maximum number of parallel tests to run at once
 MAX_PARALLEL_TESTS = 4
@@ -92,13 +102,12 @@ HW_SWITCH_CONFIG_FILE = 'hw_switch_config.yaml'
 REQUIRED_TEST_PORTS = 4
 
 
-
 class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
 
     RUN_GAUGE = True
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp(prefix='faucettests')
+        self.tmpdir = self.tmpdir_name()
         os.environ['FAUCET_CONFIG'] = os.path.join(
             self.tmpdir, 'faucet.yaml')
         os.environ['GAUGE_CONFIG'] = os.path.join(
@@ -124,9 +133,16 @@ class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
                 self.hw_switch = self.config['hw_switch']
             if self.hw_switch:
                 self.dpid = self.config['dpid']
+                self.cpn_intf = self.config['cpn_intf']
                 self.of_port = self.config['of_port']
                 self.gauge_of_port = self.config['gauge_of_port']
                 self.hardware = self.config['hardware']
+                if 'ctl_privkey' in self.config:
+                    self.ctl_privkey = self.config['ctl_privkey']
+                if 'ctl_cert' in self.config:
+                    self.ctl_cert = self.config['ctl_cert']
+                if 'ca_certs' in self.config:
+                    self.ca_certs = self.config['ca_certs']
                 dp_ports = self.config['dp_ports']
                 self.port_map = {}
                 self.switch_map = {}
@@ -141,21 +157,27 @@ class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
         else:
             self.topo_class = faucet_mininet_test_base.FaucetSwitchTopo
             self.dpid = str(random.randint(1, 2**32))
-            self.of_port, _ = faucet_mininet_test_util.find_free_port()
-            self.gauge_of_port, _ = faucet_mininet_test_util.find_free_port()
+            self.of_port, _ = faucet_mininet_test_util.find_free_port(
+                self.ports_sock)
+            self.gauge_of_port, _ = faucet_mininet_test_util.find_free_port(
+                self.ports_sock)
 
         self.CONFIG = '\n'.join((
             self.get_config_header(
                 self.CONFIG_GLOBAL, self.debug_log_path, self.dpid, self.hardware),
             self.CONFIG % self.port_map))
         open(os.environ['FAUCET_CONFIG'], 'w').write(self.CONFIG)
+        self.influx_port, _ = faucet_mininet_test_util.find_free_port(
+            self.ports_sock)
         self.GAUGE_CONFIG = self.get_gauge_config(
             os.environ['FAUCET_CONFIG'],
             self.monitor_stats_file,
             self.monitor_state_file,
-            self.monitor_flow_table_file
+            self.monitor_flow_table_file,
+            self.influx_port,
             )
         open(os.environ['GAUGE_CONFIG'], 'w').write(self.GAUGE_CONFIG)
+
         self.net = None
         self.topo = None
 
@@ -182,14 +204,28 @@ class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
 
     def start_net(self):
         """Start Mininet network."""
+        controller_intf = 'lo'
+        if self.hw_switch:
+            controller_intf = self.cpn_intf
         self.net = Mininet(
             self.topo,
             controller=faucet_mininet_test_base.FAUCET(
-                name='faucet', port=self.of_port))
+                name='faucet', tmpdir=self.tmpdir,
+                controller_intf=controller_intf,
+                ctl_privkey=self.ctl_privkey,
+                ctl_cert=self.ctl_cert,
+                ca_certs=self.ca_certs,
+                ports_sock=self.ports_sock,
+                port=self.of_port))
         self.pre_start_net()
         if self.RUN_GAUGE:
             gauge_controller = faucet_mininet_test_base.Gauge(
-                name='gauge', port=self.gauge_of_port)
+                name='gauge', tmpdir=self.tmpdir,
+                controller_intf=controller_intf,
+                ctl_privkey=self.ctl_privkey,
+                ctl_cert=self.ctl_cert,
+                ca_certs=self.ca_certs,
+                port=self.gauge_of_port)
             self.net.addController(gauge_controller)
         self.net.start()
         if self.hw_switch:
@@ -200,11 +236,13 @@ class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
         dumpNodeConnections(self.net.hosts)
 
     def tcpdump_helper(self, tcpdump_host, tcpdump_filter, funcs=[],
-                       timeout=10, packets=2):
-        tcpdump_out = tcpdump_host.popen(
-            'timeout %us tcpdump -e -n -U -v -c %u %s' % (
-                timeout, packets, tcpdump_filter),
-            stderr=subprocess.STDOUT)
+                       timeout=10, packets=2, root_intf=False):
+        intf = tcpdump_host.intf().name
+        if root_intf:
+            intf = intf.split('.')[0]
+        tcpdump_cmd = 'timeout %us tcpdump -i %s -e -n -U -v -c %u %s' % (
+            timeout, intf, packets, tcpdump_filter)
+        tcpdump_out = tcpdump_host.popen(tcpdump_cmd, stderr=subprocess.STDOUT)
         popens = {tcpdump_host: tcpdump_out}
         tcpdump_started = False
         tcpdump_txt = ''
@@ -212,12 +250,14 @@ class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
             if host == tcpdump_host:
                 if tcpdump_started:
                     tcpdump_txt += line.strip()
-                else:
+                elif re.search('tcpdump: listening on ', line):
                     # when we see tcpdump start, then call provided functions.
-                    if re.search('tcpdump: listening on ', line):
-                        tcpdump_started = True
-                        for func in funcs:
-                            func()
+                    tcpdump_started = True
+                    for func in funcs:
+                        func()
+                else:
+                    print('tcpdump_helper: %s' % line)
+        self.assertTrue(tcpdump_started)
         return tcpdump_txt
 
     def bogus_mac_flooded_to_port1(self):
@@ -232,12 +272,11 @@ class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
              lambda: self.net.ping(hosts=(second_host, third_host))])
         return not re.search('0 packets captured', tcpdump_txt)
 
-
     def verify_lldp_blocked(self):
         first_host, second_host = self.net.hosts[0:2]
         lldp_filter = 'ether proto 0x88cc'
         ladvd_mkdir = 'mkdir -p /var/run/ladvd'
-        send_lldp = 'ladvd -f -L -e lo -o %s' % second_host.defaultIntf()
+        send_lldp = '%s -L -o %s' % (self.LADVD, second_host.defaultIntf())
         tcpdump_txt = self.tcpdump_helper(
             first_host, lldp_filter,
             [lambda: second_host.cmd(ladvd_mkdir),
@@ -253,13 +292,15 @@ class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
         first_host, second_host = self.net.hosts[0:2]
         cdp_filter = 'ether host 01:00:0c:cc:cc:cc and ether[20:2]==0x2000'
         ladvd_mkdir = 'mkdir -p /var/run/ladvd'
-        send_cdp = 'ladvd -f -C -e lo -o %s' % (second_host.defaultIntf())
-        tcpdump_txt = self.tcpdump_helper(first_host, cdp_filter,
-             [lambda: second_host.cmd(ladvd_mkdir), 
-              lambda: second_host.cmd(send_cdp),
-              lambda: second_host.cmd(send_cdp),
-              lambda: second_host.cmd(send_cdp)],
-             timeout=20, packets=5)
+        send_cdp = '%s -C -o %s' % (self.LADVD, second_host.defaultIntf())
+        tcpdump_txt = self.tcpdump_helper(
+            first_host,
+            cdp_filter,
+            [lambda: second_host.cmd(ladvd_mkdir),
+             lambda: second_host.cmd(send_cdp),
+             lambda: second_host.cmd(send_cdp),
+             lambda: second_host.cmd(send_cdp)],
+            timeout=20, packets=5)
 
         if re.search(second_host.MAC(), tcpdump_txt):
             return False
@@ -300,11 +341,61 @@ class FaucetTest(faucet_mininet_test_base.FaucetTestBase):
                 continue
             self.fail(
                 'gauge did not output %s (gauge not connected?)' % watcher_file)
+        self.assertEquals(
+            0, os.path.getsize(os.environ['FAUCET_EXCEPTION_LOG']))
+
+
+class FaucetAPITest(faucet_mininet_test_base.FaucetTestBase):
+    """Test the Faucet API."""
+
+    def setUp(self):
+        self.tmpdir = self.tmpdir_name()
+        self.results_file = os.path.join(
+            self.tmpdir, 'result.txt')
+        os.environ['API_TEST_RESULT'] = self.results_file
+        shutil.copytree('config', os.path.join(self.tmpdir, 'config'))
+        os.environ['FAUCET_CONFIG'] = os.path.join(
+            self.tmpdir, 'config/testconfigv2-simple.yaml')
+        os.environ['FAUCET_LOG'] = os.path.join(
+            self.tmpdir, 'faucet.log')
+        os.environ['FAUCET_EXCEPTION_LOG'] = os.path.join(
+            self.tmpdir, 'faucet-exception.log')
+        self.dpid = str(0xcafef00d)
+        self.of_port, _ = faucet_mininet_test_util.find_free_port(
+            self.ports_sock)
+        self.topo = faucet_mininet_test_base.FaucetSwitchTopo(
+            self.ports_sock,
+            dpid=self.dpid,
+            n_untagged=7
+            )
+        self.net = Mininet(
+            self.topo,
+            controller=faucet_mininet_test_base.FaucetAPI(
+                name='faucet-api',
+                port=self.of_port
+                )
+            )
+        self.net.start()
+
+    def test_api(self):
+        countdown = 30
+        while countdown > 0:
+            try:
+                with open(self.results_file, 'r') as results:
+                    result = results.read().strip()
+                    self.assertEquals('pass', result, result)
+                    return
+            except IOError:
+                countdown -= 1
+                time.sleep(1)
+        self.fail('no result from API test')
 
 
 class FaucetUntaggedTest(FaucetTest):
     """Basic untagged VLAN test."""
 
+    N_UNTAGGED = 4
+    N_TAGGED = 0
     CONFIG_GLOBAL = """
 vlans:
     100:
@@ -329,7 +420,9 @@ vlans:
 
     def setUp(self):
         super(FaucetUntaggedTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_untagged=4)
+        self.topo = self.topo_class(
+            self.ports_sock, dpid=self.dpid,
+            n_tagged=self.N_TAGGED, n_untagged=self.N_UNTAGGED)
         self.start_net()
 
     def test_untagged(self):
@@ -339,17 +432,139 @@ vlans:
         self.gauge_smoke_test()
 
 
+class FaucetSanityTest(FaucetUntaggedTest):
+    """Sanity test - make sure test environment is correct before running all tess.""" 
+
+    pass
+
+
+class FaucetUntaggedInfluxTest(FaucetUntaggedTest):
+    """Basic untagged VLAN test with Influx."""
+
+    def get_gauge_watcher_config(self):
+        return """
+    port_stats:
+        dps: ['faucet-1']
+        type: 'port_stats'
+        interval: 2
+        db: 'influx'
+    port_state:
+        dps: ['faucet-1']
+        type: 'port_state'
+        interval: 2
+        db: 'influx'
+"""
+
+    def test_untagged_influx_down(self):
+        self.ping_all_when_learned()
+        self.assertEquals(
+            0, os.path.getsize(os.environ['FAUCET_EXCEPTION_LOG']))
+
+    def test_untagged(self):
+
+        class PostHandler(SimpleHTTPRequestHandler):
+
+            def do_POST(self):
+                content_len = int(self.headers.getheader('content-length', 0))
+                content = self.rfile.read(content_len)
+                open(os.environ['INFLUXLOG'], 'a').write(content)
+                return self.send_response(204)
+
+        os.environ['INFLUXLOG'] = os.path.join(self.tmpdir, 'influx.log')
+        server = HTTPServer(('', self.influx_port), PostHandler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        self.ping_all_when_learned()
+        for _ in range(3):
+            if os.path.exists(os.environ['INFLUXLOG']):
+                break
+            time.sleep(2)
+        server.shutdown()
+        self.assertTrue(os.path.exists(os.environ['INFLUXLOG']))
+
+
+class FaucetNailedForwardingTest(FaucetUntaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "untagged"
+acls:
+    1:
+        - rule:
+            dl_dst: "0e:00:00:00:01:01"
+            actions:
+                output:
+                    port: b1
+        - rule:
+            dl_dst: "0e:00:00:00:02:02"
+            actions:
+                output:
+                    port: b2
+        - rule:
+            dl_type: 0x806
+            dl_dst: "ff:ff:ff:ff:ff:ff"
+            arp_tpa: "10.0.0.1"
+            actions:
+                output:
+                    port: b1
+        - rule:
+            dl_type: 0x806
+            dl_dst: "ff:ff:ff:ff:ff:ff"
+            arp_tpa: "10.0.0.2"
+            actions:
+                output:
+                    port: b2
+        - rule:
+            actions:
+                allow: 0
+"""
+
+    CONFIG = """
+        interfaces:
+            b1:
+                number: %(port_1)d
+                native_vlan: 100
+                acl_in: 1
+            b2:
+                number: %(port_2)d
+                native_vlan: 100
+                acl_in: 1
+            b3:
+                number: %(port_3)d
+                native_vlan: 100
+                acl_in: 1
+            b4:
+                number: %(port_4)d
+                native_vlan: 100
+                acl_in: 1
+"""
+
+    def test_untagged(self):
+        first_host, second_host = self.net.hosts[0:2]
+        first_host.setMAC("0e:00:00:00:01:01")
+        second_host.setMAC("0e:00:00:00:02:02")
+        self.one_ipv4_ping(
+            first_host, second_host.IP(), require_host_learned=False)
+        self.one_ipv4_ping(
+            second_host, first_host.IP(), require_host_learned=False)
+
+
+
 class FaucetUntaggedLLDPBlockedTest(FaucetUntaggedTest):
 
     def test_untagged(self):
         self.ping_all_when_learned()
         self.assertTrue(self.verify_lldp_blocked())
 
+
 class FaucetUntaggedCDPTest(FaucetUntaggedTest):
 
     def test_untagged(self):
         self.ping_all_when_learned()
         self.assertFalse(self.is_cdp_blocked())
+
 
 class FaucetUntaggedLLDPUnblockedTest(FaucetUntaggedTest):
 
@@ -379,11 +594,7 @@ class FaucetZodiacUntaggedTest(FaucetUntaggedTest):
     """Zodiac has only 3 ports available, and one controller so no Gauge."""
 
     RUN_GAUGE = False
-
-    def setUp(self):
-        super(FaucetUntaggedTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_untagged=3)
-        self.start_net()
+    N_UNTAGGED = 3
 
     def test_untagged(self):
         """All hosts on the same untagged VLAN should have connectivity."""
@@ -419,7 +630,8 @@ vlans:
 
     def setUp(self):
         super(FaucetTaggedAndUntaggedVlanTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_tagged=1, n_untagged=3)
+        self.topo = self.topo_class(
+            self.ports_sock, dpid=self.dpid, n_tagged=1, n_untagged=3)
         self.start_net()
 
     def test_untagged(self):
@@ -432,7 +644,8 @@ vlans:
 class FaucetZodiacTaggedAndUntaggedVlanTest(FaucetUntaggedTest):
 
     RUN_GAUGE = False
-
+    N_TAGGED = 1
+    N_UNTAGGED = 2
     CONFIG_GLOBAL = """
 vlans:
     100:
@@ -454,11 +667,6 @@ vlans:
                 native_vlan: 100
                 description: "b4"
 """
-
-    def setUp(self):
-        super(FaucetUntaggedTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_tagged=1, n_untagged=2)
-        self.start_net()
 
     def test_untagged(self):
         """Test connectivity including after port flapping."""
@@ -493,7 +701,6 @@ vlans:
 """
 
     def test_untagged(self):
-        self.force_faucet_reload('       timeout: 60')
         self.net.pingAll()
         learned_hosts = [
             host for host in self.net.hosts if self.host_learned(host)]
@@ -574,11 +781,11 @@ acls:
             flow_p1 = self.get_matching_flow_on_dpid(
                 self.dpid,
                 ('"table_id": 1, "match": '
-                 '{"dl_vlan": "0x0000", "in_port": 1}'))
+                 '{"dl_vlan": "0x0000", "in_port": %(port_1)d}' % self.port_map))
             flow_p3 = self.get_matching_flow_on_dpid(
                 self.dpid,
                 ('"table_id": 1, "match": '
-                 '{"dl_vlan": "0x0000", "in_port": 3}'))
+                 '{"dl_vlan": "0x0000", "in_port": %(port_3)d}' % self.port_map))
             prev_dur_p1 = flow_p1['duration_sec']
             prev_dur_p3 = flow_p3['duration_sec']
             if vid == 200:
@@ -594,11 +801,11 @@ acls:
             flow_p1 = self.get_matching_flow_on_dpid(
                 self.dpid,
                 ('"table_id": 1, "match": '
-                 '{"dl_vlan": "0x0000", "in_port": 1}'))
+                 '{"dl_vlan": "0x0000", "in_port": %(port_1)d}' % self.port_map))
             flow_p3 = self.get_matching_flow_on_dpid(
                 self.dpid,
                 ('"table_id": 1, "match": '
-                 '{"dl_vlan": "0x0000", "in_port": 3}'))
+                 '{"dl_vlan": "0x0000", "in_port": %(port_3)d}' % self.port_map))
             actions = flow_p1.get('actions', '')
             actions = [act for act in actions if 'vlan_vid' in act]
             vid_ = re.findall(r'\d+', str(actions))
@@ -632,7 +839,7 @@ acls:
             self.hup_faucet()
             self.wait_until_matching_flow(
                 ('{"dl_type": 2048, "nw_proto": 17,'
-                 ' "in_port": 1, "tp_dst": %d}' % (8000+i)))
+                 ' "in_port": %d, "tp_dst": %d}' % (self.port_map["port_1"], 8000+i)))
 
 
 class FaucetSingleUntaggedBGPIPv4RouteTest(FaucetUntaggedTest):
@@ -642,7 +849,7 @@ class FaucetSingleUntaggedBGPIPv4RouteTest(FaucetUntaggedTest):
 vlans:
     100:
         description: "untagged"
-        controller_ips: ["10.0.0.254/24"]
+        faucet_vips: ["10.0.0.254/24"]
         bgp_port: 9179
         bgp_as: 1
         bgp_routerid: "1.1.1.1"
@@ -656,6 +863,7 @@ vlans:
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 native_vlan: 100
@@ -683,6 +891,8 @@ group test {
       route 10.0.1.0/24 next-hop 10.0.0.1 local-preference 100;
       route 10.0.2.0/24 next-hop 10.0.0.2 local-preference 100;
       route 10.0.3.0/24 next-hop 10.0.0.2 local-preference 100;
+      route 10.0.4.0/24 next-hop 10.0.0.254;
+      route 10.0.5.0/24 next-hop 10.10.0.1;
    }
  }
 }
@@ -697,11 +907,13 @@ group test {
         first_host, second_host = self.net.hosts[:2]
         # wait until 10.0.0.1 has been resolved
         self.wait_for_route_as_flow(
-            first_host.MAC(), ipaddr.IPv4Network('10.99.99.0/24'))
+            first_host.MAC(), ipaddress.IPv4Network(u'10.99.99.0/24'))
         self.wait_bgp_up(self.exabgp_log)
         self.wait_exabgp_sent_updates(self.exabgp_log)
+        self.verify_invalid_bgp_route('10.0.0.4/24 cannot be us')
+        self.verify_invalid_bgp_route('10.0.0.5/24 is not a connected network')
         self.wait_for_route_as_flow(
-            second_host.MAC(), ipaddr.IPv4Network('10.0.3.0/24'))
+            second_host.MAC(), ipaddress.IPv4Network(u'10.0.3.0/24'))
         self.verify_ipv4_routing_mesh()
         self.flap_all_switch_ports()
         self.verify_ipv4_routing_mesh()
@@ -715,7 +927,7 @@ class FaucetSingleUntaggedIPv4RouteTest(FaucetUntaggedTest):
 vlans:
     100:
         description: "untagged"
-        controller_ips: ["10.0.0.254/24"]
+        faucet_vips: ["10.0.0.254/24"]
         bgp_port: 9179
         bgp_as: 1
         bgp_routerid: "1.1.1.1"
@@ -735,6 +947,7 @@ vlans:
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 native_vlan: 100
@@ -790,11 +1003,7 @@ group test {
 class FaucetSingleZodiacUntaggedIPv4RouteTest(FaucetSingleUntaggedIPv4RouteTest):
 
     RUN_GAUGE = False
-
-    def setUp(self):
-        super(FaucetUntaggedTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_untagged=3)
-        self.start_net()
+    N_UNTAGGED = 3
 
 
 class FaucetUntaggedVLanUnicastFloodTest(FaucetUntaggedTest):
@@ -826,10 +1035,10 @@ vlans:
         self.assertTrue(self.bogus_mac_flooded_to_port1())
         # Unicast flooding rule for from port 1
         self.assertTrue(self.matching_flow_present(
-            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": 1}'))
+            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": %(port_1)d}' % self.port_map))
         # Unicast flood rule exists that output to port 1
         self.assertTrue(self.matching_flow_present(
-            '"OUTPUT:1".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .}'))
+            '"OUTPUT:%(port_1)d".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .+}' % self.port_map))
 
 
 class FaucetUntaggedNoVLanUnicastFloodTest(FaucetUntaggedTest):
@@ -861,10 +1070,10 @@ vlans:
         self.assertFalse(self.bogus_mac_flooded_to_port1())
         # No unicast flooding rule for from port 1
         self.assertFalse(self.matching_flow_present(
-            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": 1}'))
+            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": %(port_1)d}' % self.port_map))
         # No unicast flood rule exists that output to port 1
         self.assertFalse(self.matching_flow_present(
-            '"OUTPUT:1".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .}'))
+            '"OUTPUT:%(port_1)d".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .+}' % self.port_map))
 
 
 class FaucetUntaggedPortUnicastFloodTest(FaucetUntaggedTest):
@@ -899,10 +1108,10 @@ vlans:
         self.assertFalse(self.bogus_mac_flooded_to_port1())
         # No unicast flooding rule for from port 1
         self.assertFalse(self.matching_flow_present(
-            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": 1}'))
+            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": %(port_1)d}' % self.port_map))
         # No unicast flood rule exists that output to port 1
         self.assertFalse(self.matching_flow_present(
-            '"OUTPUT:1".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .}'))
+            '"OUTPUT:%(port_1)d".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .+}' % self.port_map))
 
 
 class FaucetUntaggedNoPortUnicastFloodTest(FaucetUntaggedTest):
@@ -935,14 +1144,14 @@ vlans:
         self.assertFalse(self.bogus_mac_flooded_to_port1())
         # Unicast flood rule present for port 2, but NOT for port 1
         self.assertTrue(self.matching_flow_present(
-            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": 2}'))
+            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": %(port_2)d}' % self.port_map))
         self.assertFalse(self.matching_flow_present(
-            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": 1}'))
+            '"table_id": 7, "match": {"dl_vlan": "100", "in_port": %(port_1)d}' % self.port_map))
         # Unicast flood rules present that output to port 2, but NOT to port 1
         self.assertTrue(self.matching_flow_present(
-            '"OUTPUT:2".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .}'))
+            '"OUTPUT:%(port_2)d".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .+}' % self.port_map))
         self.assertFalse(self.matching_flow_present(
-            '"OUTPUT:1".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .}'))
+            '"OUTPUT:%(port_1)d".+"table_id": 7, "match": {"dl_vlan": "100", "in_port": .+}' % self.port_map))
 
 
 class FaucetUntaggedHostMoveTest(FaucetUntaggedTest):
@@ -995,16 +1204,52 @@ vlans:
         self.ping_all_when_learned()
 
 
-class FaucetUntaggedControlPlaneTest(FaucetUntaggedTest):
+class FaucetUntaggedIPv4ControlPlaneTest(FaucetUntaggedTest):
 
     CONFIG_GLOBAL = """
 vlans:
     100:
         description: "untagged"
-        controller_ips: ["10.0.0.254/24", "fc00::1:254/112"]
+        faucet_vips: ["10.0.0.254/24"]
 """
 
     CONFIG = """
+        max_resolve_backoff_time: 1
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+            %(port_2)d:
+                native_vlan: 100
+                description: "b2"
+            %(port_3)d:
+                native_vlan: 100
+                description: "b3"
+            %(port_4)d:
+                native_vlan: 100
+                description: "b4"
+"""
+
+    def test_ping_controller(self):
+        first_host, second_host = self.net.hosts[0:2]
+        for _ in range(5):
+            self.one_ipv4_ping(first_host, second_host.IP())
+            for host in first_host, second_host:
+                self.one_ipv4_controller_ping(host)
+            self.flap_all_switch_ports()
+
+
+class FaucetUntaggedIPv6ControlPlaneTest(FaucetUntaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "untagged"
+        faucet_vips: ["fc00::1:254/112"]
+"""
+
+    CONFIG = """
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 native_vlan: 100
@@ -1024,13 +1269,9 @@ vlans:
         first_host, second_host = self.net.hosts[0:2]
         self.add_host_ipv6_address(first_host, 'fc00::1:1/112')
         self.add_host_ipv6_address(second_host, 'fc00::1:2/112')
-        for _ in range(2):
-            # Verify IPv4 and IPv6 connectivity between first two hosts.
-            self.one_ipv4_ping(first_host, second_host.IP())
+        for _ in range(5):
             self.one_ipv6_ping(first_host, 'fc00::1:2')
-            # Verify first two hosts can ping controller over both IPv4 and IPv6
             for host in first_host, second_host:
-                self.one_ipv4_controller_ping(host)
                 self.one_ipv6_controller_ping(host)
             self.flap_all_switch_ports()
 
@@ -1063,7 +1304,8 @@ vlans:
 
     def setUp(self):
         super(FaucetTaggedAndUntaggedTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_tagged=2, n_untagged=2)
+        self.topo = self.topo_class(
+            self.ports_sock, dpid=self.dpid, n_tagged=2, n_untagged=2)
         self.start_net()
 
     def test_seperate_untagged_tagged(self):
@@ -1132,11 +1374,7 @@ acls:
 class FaucetZodiacUntaggedACLTest(FaucetUntaggedACLTest):
 
     RUN_GAUGE = False
-
-    def setUp(self):
-        super(FaucetUntaggedTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_untagged=3)
-        self.start_net()
+    N_UNTAGGED = 3
 
     def test_untagged(self):
         """All hosts on the same untagged VLAN should have connectivity."""
@@ -1187,21 +1425,7 @@ acls:
 class FaucetZodiacUntaggedACLMirrorTest(FaucetUntaggedACLMirrorTest):
 
     RUN_GAUGE = False
-
-    def setUp(self):
-        super(FaucetUntaggedTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_untagged=3)
-        self.start_net()
-
-    def test_untagged(self):
-        """All hosts on the same untagged VLAN should have connectivity."""
-        self.ping_all_when_learned()
-        self.flap_all_switch_ports()
-        self.ping_all_when_learned()
-
-    def test_untagged(self):
-        first_host, second_host, mirror_host = self.net.hosts[0:3]
-        self.verify_ping_mirrored(first_host, second_host, mirror_host)
+    N_UNTAGGED = 3
 
 
 class FaucetUntaggedACLMirrorDefaultAllowTest(FaucetUntaggedACLMirrorTest):
@@ -1289,6 +1513,58 @@ acls:
             'vlan 123', tcpdump_txt))
 
 
+class FaucetUntaggedMultiVlansOutputTest(FaucetUntaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "untagged"
+        unicast_flood: False
+acls:
+    1:
+        - rule:
+            dl_dst: "01:02:03:04:05:06"
+            actions:
+                output:
+                    dl_dst: "06:06:06:06:06:06"
+                    vlan_vids: [123, 456]
+                    port: acloutport
+"""
+
+    CONFIG = """
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+                acl_in: 1
+            acloutport:
+                number: %(port_2)d
+                native_vlan: 100
+                description: "b2"
+            %(port_3)d:
+                native_vlan: 100
+                description: "b3"
+            %(port_4)d:
+                native_vlan: 100
+                description: "b4"
+"""
+
+    @unittest.skip('needs OVS dev or > v2.8')
+    def test_untagged(self):
+        first_host, second_host = self.net.hosts[0:2]
+        # we expected to see the rewritten address and VLAN
+        tcpdump_filter = 'vlan'
+        tcpdump_txt = self.tcpdump_helper(
+            second_host, tcpdump_filter, [
+                lambda: first_host.cmd(
+                    'arp -s %s %s' % (second_host.IP(), '01:02:03:04:05:06')),
+                lambda: first_host.cmd('ping -c1 %s' % second_host.IP())])
+        self.assertTrue(re.search(
+            '%s: ICMP echo request' % second_host.IP(), tcpdump_txt))
+        self.assertTrue(re.search(
+            'vlan 456.+vlan 123', tcpdump_txt))
+
+
 class FaucetUntaggedMirrorTest(FaucetUntaggedTest):
 
     CONFIG_GLOBAL = """
@@ -1346,23 +1622,107 @@ vlans:
 
     def setUp(self):
         super(FaucetTaggedTest, self).setUp()
-        self.topo = self.topo_class(dpid=self.dpid, n_tagged=4)
+        self.topo = self.topo_class(
+            self.ports_sock, dpid=self.dpid, n_tagged=4)
         self.start_net()
 
     def test_tagged(self):
         self.ping_all_when_learned()
 
 
-class FaucetTaggedControlPlaneTest(FaucetTaggedTest):
+class FaucetTaggedPopVlansOutputTest(FaucetTaggedTest):
 
     CONFIG_GLOBAL = """
 vlans:
     100:
         description: "tagged"
-        controller_ips: ["10.0.0.254/24", "fc00::1:254/112"]
+        unicast_flood: False
+acls:
+    1:
+        - rule:
+            vlan_vid: 100
+            dl_dst: "01:02:03:04:05:06"
+            actions:
+                output:
+                    dl_dst: "06:06:06:06:06:06"
+                    pop_vlans: 1
+                    port: acloutport
 """
 
     CONFIG = """
+        interfaces:
+            %(port_1)d:
+                tagged_vlans: [100]
+                description: "b1"
+                acl_in: 1
+            acloutport:
+                tagged_vlans: [100]
+                number: %(port_2)d
+                description: "b2"
+            %(port_3)d:
+                tagged_vlans: [100]
+                description: "b3"
+            %(port_4)d:
+                tagged_vlans: [100]
+                description: "b4"
+"""
+
+    def test_tagged(self):
+        first_host, second_host = self.net.hosts[0:2]
+        tcpdump_filter = 'not vlan and icmp and ether dst 06:06:06:06:06:06'
+        tcpdump_txt = self.tcpdump_helper(
+            second_host, tcpdump_filter, [
+                lambda: first_host.cmd(
+                    'arp -s %s %s' % (second_host.IP(), '01:02:03:04:05:06')),
+                lambda: first_host.cmd('ping -c1 %s' % second_host.IP())], packets=10, root_intf=True)
+        self.assertTrue(re.search(
+            '%s: ICMP echo request' % second_host.IP(), tcpdump_txt))
+
+
+class FaucetTaggedIPv4ControlPlaneTest(FaucetTaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "tagged"
+        faucet_vips: ["10.0.0.254/24"]
+"""
+
+    CONFIG = """
+        max_resolve_backoff_time: 1
+        interfaces:
+            %(port_1)d:
+                tagged_vlans: [100]
+                description: "b1"
+            %(port_2)d:
+                tagged_vlans: [100]
+                description: "b2"
+            %(port_3)d:
+                tagged_vlans: [100]
+                description: "b3"
+            %(port_4)d:
+                tagged_vlans: [100]
+                description: "b4"
+"""
+
+    def test_ping_controller(self):
+        first_host, second_host = self.net.hosts[0:2]
+        self.one_ipv4_ping(first_host, second_host.IP())
+        for host in first_host, second_host:
+            self.one_ipv4_controller_ping(host)
+
+
+class FaucetTaggedIPv6ControlPlaneTest(FaucetTaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "tagged"
+        faucet_vips: ["fc00::1:254/112"]
+"""
+
+    CONFIG = """
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 tagged_vlans: [100]
@@ -1382,12 +1742,8 @@ vlans:
         first_host, second_host = self.net.hosts[0:2]
         self.add_host_ipv6_address(first_host, 'fc00::1:1/112')
         self.add_host_ipv6_address(second_host, 'fc00::1:2/112')
-        # Verify IPv4 and IPv6 connectivity between first two hosts.
-        self.one_ipv4_ping(first_host, second_host.IP())
         self.one_ipv6_ping(first_host, 'fc00::1:2')
-        # Verify first two hosts can ping controller over both IPv4 and IPv6
         for host in first_host, second_host:
-            self.one_ipv4_controller_ping(host)
             self.one_ipv6_controller_ping(host)
 
 
@@ -1397,7 +1753,7 @@ class FaucetTaggedIPv4RouteTest(FaucetTaggedTest):
 vlans:
     100:
         description: "tagged"
-        controller_ips: ["10.0.0.254/24"]
+        faucet_vips: ["10.0.0.254/24"]
         routes:
             - route:
                 ip_dst: "10.0.1.0/24"
@@ -1412,6 +1768,7 @@ vlans:
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 tagged_vlans: [100]
@@ -1430,15 +1787,62 @@ vlans:
     def test_tagged(self):
         host_pair = self.net.hosts[:2]
         first_host, second_host = host_pair
-        first_host_routed_ip = ipaddr.IPv4Network('10.0.1.1/24')
-        second_host_routed_ip = ipaddr.IPv4Network('10.0.2.1/24')
-        self.verify_ipv4_routing(
-            first_host, first_host_routed_ip,
-            second_host, second_host_routed_ip)
-        self.swap_host_macs(first_host, second_host)
-        self.verify_ipv4_routing(
-            first_host, first_host_routed_ip,
-            second_host, second_host_routed_ip)
+        first_host_routed_ip = ipaddress.ip_interface(u'10.0.1.1/24')
+        second_host_routed_ip = ipaddress.ip_interface(u'10.0.2.1/24')
+        for _ in range(3):
+            self.verify_ipv4_routing(
+                first_host, first_host_routed_ip,
+                second_host, second_host_routed_ip)
+            self.swap_host_macs(first_host, second_host)
+
+
+class FaucetUntaggedIPv4InterVLANRouteTest(FaucetUntaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "100"
+        faucet_vips: ["10.100.0.254/24"]
+    200:
+        description: "200"
+        faucet_vips: ["10.200.0.254/24"]
+routers:
+    router-1:
+        vlans: [100, 200]
+"""
+
+    CONFIG = """
+        arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+            %(port_2)d:
+                native_vlan: 200
+                description: "b2"
+            %(port_3)d:
+                native_vlan: 200
+                description: "b3"
+            %(port_4)d:
+                native_vlan: 200
+                description: "b4"
+"""
+
+    def test_untagged(self):
+        first_host_ip = ipaddress.ip_interface(u'10.100.0.1/24')
+        first_faucet_vip = ipaddress.ip_interface(u'10.100.0.254/24')
+        second_host_ip = ipaddress.ip_interface(u'10.200.0.1/24')
+        second_faucet_vip = ipaddress.ip_interface(u'10.200.0.254/24')
+        first_host, second_host = self.net.hosts[:2]
+        first_host.setIP(str(first_host_ip.ip))
+        second_host.setIP(str(second_host_ip.ip))
+        self.add_host_route(first_host, second_host_ip, first_faucet_vip.ip)
+        self.add_host_route(second_host, first_host_ip, second_faucet_vip.ip)
+        self.one_ipv4_ping(first_host, first_faucet_vip.ip)
+        self.one_ipv4_ping(second_host, second_faucet_vip.ip)
+        self.one_ipv4_ping(first_host, second_host_ip.ip)
+        self.one_ipv4_ping(second_host, first_host_ip.ip)
 
 
 class FaucetUntaggedMixedIPv4RouteTest(FaucetUntaggedTest):
@@ -1447,11 +1851,12 @@ class FaucetUntaggedMixedIPv4RouteTest(FaucetUntaggedTest):
 vlans:
     100:
         description: "untagged"
-        controller_ips: ["172.16.0.254/24", "10.0.0.254/24"]
+        faucet_vips: ["172.16.0.254/24", "10.0.0.254/24"]
 """
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 native_vlan: 100
@@ -1470,15 +1875,15 @@ vlans:
     def test_untagged(self):
         host_pair = self.net.hosts[:2]
         first_host, second_host = host_pair
-        first_host_net = ipaddr.IPv4Network('10.0.0.1/24')
-        second_host_net = ipaddr.IPv4Network('172.16.0.1/24')
+        first_host_net = ipaddress.ip_interface(u'10.0.0.1/24')
+        second_host_net = ipaddress.ip_interface(u'172.16.0.1/24')
         second_host.setIP(str(second_host_net.ip))
-        self.one_ipv4_ping(first_host, self.CONTROLLER_IPV4.ip)
-        self.one_ipv4_ping(second_host, self.CONTROLLER_IPV4_2.ip)
-        self.add_host_ipv4_route(
-            first_host, second_host_net.masked(), self.CONTROLLER_IPV4.ip)
-        self.add_host_ipv4_route(
-            second_host, first_host_net.masked(), self.CONTROLLER_IPV4_2.ip)
+        self.one_ipv4_ping(first_host, self.FAUCET_VIPV4.ip)
+        self.one_ipv4_ping(second_host, self.FAUCET_VIPV4_2.ip)
+        self.add_host_route(
+            first_host, second_host_net, self.FAUCET_VIPV4.ip)
+        self.add_host_route(
+            second_host, first_host_net, self.FAUCET_VIPV4_2.ip)
         self.one_ipv4_ping(first_host, second_host_net.ip)
         self.one_ipv4_ping(second_host, first_host_net.ip)
 
@@ -1489,11 +1894,12 @@ class FaucetUntaggedMixedIPv6RouteTest(FaucetUntaggedTest):
 vlans:
     100:
         description: "untagged"
-        controller_ips: ["fc00::1:254/64", "fc01::1:254/64"]
+        faucet_vips: ["fc00::1:254/64", "fc01::1:254/64"]
 """
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 native_vlan: 100
@@ -1512,16 +1918,16 @@ vlans:
     def test_untagged(self):
         host_pair = self.net.hosts[:2]
         first_host, second_host = host_pair
-        first_host_net = ipaddr.IPv6Network('fc00::1:1/64')
-        second_host_net = ipaddr.IPv6Network('fc01::1:1/64')
+        first_host_net = ipaddress.ip_interface(u'fc00::1:1/64')
+        second_host_net = ipaddress.ip_interface(u'fc01::1:1/64')
         self.add_host_ipv6_address(first_host, first_host_net)
-        self.one_ipv6_ping(first_host, self.CONTROLLER_IPV6.ip)
+        self.one_ipv6_ping(first_host, self.FAUCET_VIPV6.ip)
         self.add_host_ipv6_address(second_host, second_host_net)
-        self.one_ipv6_ping(second_host, self.CONTROLLER_IPV6_2.ip)
-        self.add_host_ipv6_route(
-            first_host, second_host_net.masked(), self.CONTROLLER_IPV6.ip)
-        self.add_host_ipv6_route(
-            second_host, first_host_net.masked(), self.CONTROLLER_IPV6_2.ip)
+        self.one_ipv6_ping(second_host, self.FAUCET_VIPV6_2.ip)
+        self.add_host_route(
+            first_host, second_host_net, self.FAUCET_VIPV6.ip)
+        self.add_host_route(
+            second_host, first_host_net, self.FAUCET_VIPV6_2.ip)
         self.one_ipv6_ping(first_host, second_host_net.ip)
         self.one_ipv6_ping(second_host, first_host_net.ip)
 
@@ -1532,7 +1938,7 @@ class FaucetSingleUntaggedBGPIPv6RouteTest(FaucetUntaggedTest):
 vlans:
     100:
         description: "untagged"
-        controller_ips: ["fc00::1:254/112"]
+        faucet_vips: ["fc00::1:254/112"]
         bgp_port: 9179
         bgp_as: 1
         bgp_routerid: "1.1.1.1"
@@ -1542,6 +1948,7 @@ vlans:
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 native_vlan: 100
@@ -1569,6 +1976,8 @@ group test {
       route fc00::10:1/112 next-hop fc00::1:1 local-preference 100;
       route fc00::20:1/112 next-hop fc00::1:2 local-preference 100;
       route fc00::30:1/112 next-hop fc00::1:2 local-preference 100;
+      route fc00::40:1/112 next-hop fc00::1:254;
+      route fc00::50:1/112 next-hop fc00::2:2;
     }
   }
 }
@@ -1581,6 +1990,8 @@ group test {
     def test_untagged(self):
         self.wait_bgp_up(self.exabgp_log)
         self.wait_exabgp_sent_updates(self.exabgp_log)
+        self.verify_invalid_bgp_route('fc00::40:1/112 cannot be us')
+        self.verify_invalid_bgp_route('fc00::50:1/112 is not a connected network')
         self.verify_ipv6_routing_mesh()
         self.flap_all_switch_ports()
         self.verify_ipv6_routing_mesh()
@@ -1593,7 +2004,7 @@ class FaucetUntaggedSameVlanIPv6RouteTest(FaucetUntaggedTest):
 vlans:
     100:
         description: "untagged"
-        controller_ips: ["fc00::10:1/112", "fc00::20:1/112"]
+        faucet_vips: ["fc00::10:1/112", "fc00::20:1/112"]
         routes:
             - route:
                 ip_dst: "fc00::10:0/112"
@@ -1605,6 +2016,7 @@ vlans:
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 native_vlan: 100
@@ -1622,20 +2034,20 @@ vlans:
 
     def test_untagged(self):
         first_host, second_host = self.net.hosts[:2]
-        first_host_ip = ipaddr.IPv6Network('fc00::10:2/112')
-        first_host_ctrl_ip = ipaddr.IPv6Address('fc00::10:1')
-        second_host_ip = ipaddr.IPv6Network('fc00::20:2/112')
-        second_host_ctrl_ip = ipaddr.IPv6Address('fc00::20:1')
+        first_host_ip = ipaddress.ip_interface(u'fc00::10:2/112')
+        first_host_ctrl_ip = ipaddress.ip_address(u'fc00::10:1')
+        second_host_ip = ipaddress.ip_interface(u'fc00::20:2/112')
+        second_host_ctrl_ip = ipaddress.ip_address(u'fc00::20:1')
         self.add_host_ipv6_address(first_host, first_host_ip)
         self.add_host_ipv6_address(second_host, second_host_ip)
-        self.add_host_ipv6_route(
+        self.add_host_route(
             first_host, second_host_ip, first_host_ctrl_ip)
-        self.add_host_ipv6_route(
+        self.add_host_route(
             second_host, first_host_ip, second_host_ctrl_ip)
         self.wait_for_route_as_flow(
-            first_host.MAC(), first_host_ip)
+            first_host.MAC(), first_host_ip.network)
         self.wait_for_route_as_flow(
-            second_host.MAC(), second_host_ip)
+            second_host.MAC(), second_host_ip.network)
         self.one_ipv6_ping(first_host, second_host_ip.ip)
         self.one_ipv6_ping(first_host, second_host_ctrl_ip)
         self.one_ipv6_ping(second_host, first_host_ip.ip)
@@ -1648,7 +2060,7 @@ class FaucetSingleUntaggedIPv6RouteTest(FaucetUntaggedTest):
 vlans:
     100:
         description: "untagged"
-        controller_ips: ["fc00::1:254/112"]
+        faucet_vips: ["fc00::1:254/112"]
         bgp_port: 9179
         bgp_as: 1
         bgp_routerid: "1.1.1.1"
@@ -1668,6 +2080,7 @@ vlans:
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 native_vlan: 100
@@ -1710,7 +2123,7 @@ group test {
         second_host = self.net.hosts[1]
         self.flap_all_switch_ports()
         self.wait_for_route_as_flow(
-            second_host.MAC(), ipaddr.IPv6Network('fc00::30:0/112'))
+            second_host.MAC(), ipaddress.IPv6Network(u'fc00::30:0/112'))
         self.verify_ipv6_routing_mesh()
         self.wait_bgp_up(self.exabgp_log)
         updates = self.exabgp_updates(self.exabgp_log)
@@ -1728,7 +2141,7 @@ class FaucetTaggedIPv6RouteTest(FaucetTaggedTest):
 vlans:
     100:
         description: "tagged"
-        controller_ips: ["fc00::1:254/112"]
+        faucet_vips: ["fc00::1:254/112"]
         routes:
             - route:
                 ip_dst: "fc00::10:0/112"
@@ -1740,6 +2153,7 @@ vlans:
 
     CONFIG = """
         arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
         interfaces:
             %(port_1)d:
                 tagged_vlans: [100]
@@ -1759,22 +2173,20 @@ vlans:
         """Test IPv6 routing works."""
         host_pair = self.net.hosts[:2]
         first_host, second_host = host_pair
-        first_host_ip = ipaddr.IPv6Network('fc00::1:1/112')
-        second_host_ip = ipaddr.IPv6Network('fc00::1:2/112')
-        first_host_routed_ip = ipaddr.IPv6Network('fc00::10:1/112')
-        second_host_routed_ip = ipaddr.IPv6Network('fc00::20:1/112')
-        self.verify_ipv6_routing_pair(
-            first_host, first_host_ip, first_host_routed_ip,
-            second_host, second_host_ip, second_host_routed_ip)
-        self.swap_host_macs(first_host, second_host)
-        self.verify_ipv6_routing_pair(
-            first_host, first_host_ip, first_host_routed_ip,
-            second_host, second_host_ip, second_host_routed_ip)
+        first_host_ip = ipaddress.ip_interface(u'fc00::1:1/112')
+        second_host_ip = ipaddress.ip_interface(u'fc00::1:2/112')
+        first_host_routed_ip = ipaddress.ip_interface(u'fc00::10:1/112')
+        second_host_routed_ip = ipaddress.ip_interface(u'fc00::20:1/112')
+        for _ in range(5):
+            self.verify_ipv6_routing_pair(
+                first_host, first_host_ip, first_host_routed_ip,
+                second_host, second_host_ip, second_host_routed_ip)
+            self.swap_host_macs(first_host, second_host)
 
 
 class FaucetStringOfDPSwitchTopo(faucet_mininet_test_base.FaucetSwitchTopo):
 
-    def build(self, dpids, n_tagged=0, tagged_vid=100, n_untagged=0):
+    def build(self, ports_sock, dpids, n_tagged=0, tagged_vid=100, n_untagged=0):
         """String of datapaths each with hosts with a single FAUCET controller.
 
                                Hosts
@@ -1802,7 +2214,8 @@ class FaucetStringOfDPSwitchTopo(faucet_mininet_test_base.FaucetSwitchTopo):
         """
         last_switch = None
         for dpid in dpids:
-            port, ports_served = faucet_mininet_test_util.find_free_port()
+            port, ports_served = faucet_mininet_test_util.find_free_port(
+                ports_sock)
             sid_prefix = self._get_sid_prefix(ports_served)
             hosts = []
             for host_n in range(n_tagged):
@@ -1848,12 +2261,12 @@ class FaucetStringOfDPTest(FaucetTest):
         )
         open(os.environ['FAUCET_CONFIG'], 'w').write(self.CONFIG)
         self.topo = FaucetStringOfDPSwitchTopo(
+            self.ports_sock,
             dpids=self.dpids,
             n_tagged=n_tagged,
             tagged_vid=tagged_vid,
             n_untagged=n_untagged,
         )
-
 
     def get_config(self, dpids=[], stack=False, hardware=None, ofchannel_log=None,
                    n_tagged=0, tagged_vid=0, n_untagged=0, untagged_vid=0,
@@ -2193,26 +2606,160 @@ class FaucetSingleStringOfDPACLOverrideTest(FaucetStringOfDPTest):
         self.verify_tp_dst_notblocked(5002, first_host, second_host)
 
 
-def import_config():
+class FaucetGroupTableTest(FaucetUntaggedTest):
+    CONFIG = """
+        group_table: True
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+            %(port_2)d:
+                native_vlan: 100
+                description: "b2"
+            %(port_3)d:
+                native_vlan: 100
+                description: "b3"
+            %(port_4)d:
+                native_vlan: 100
+                description: "b4"
+"""
+
+    def test_group_exist(self):
+        self.assertEqual(
+            100,
+            self.get_group_id_for_matching_flow(
+                '"table_id": 7,.+"dl_dst".+"dl_vlan": "100"'))
+
+
+class FaucetSingleGroupTableUntaggedIPv4RouteTest(FaucetUntaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "untagged"
+        faucet_vips: ["10.0.0.254/24"]
+        routes:
+            - route:
+                ip_dst: "10.0.1.0/24"
+                ip_gw: "10.0.0.1"
+            - route:
+                ip_dst: "10.0.2.0/24"
+                ip_gw: "10.0.0.2"
+            - route:
+                ip_dst: "10.0.3.0/24"
+                ip_gw: "10.0.0.2"
+"""
+    CONFIG = """
+        arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
+        group_table: True
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+            %(port_2)d:
+                native_vlan: 100
+                description: "b2"
+            %(port_3)d:
+                native_vlan: 100
+                description: "b3"
+            %(port_4)d:
+                native_vlan: 100
+                description: "b4"
+"""
+
+    def test_untagged(self):
+        host_pair = self.net.hosts[:2]
+        first_host, second_host = host_pair
+        first_host_routed_ip = ipaddress.ip_interface(u'10.0.1.1/24')
+        second_host_routed_ip = ipaddress.ip_interface(u'10.0.2.1/24')
+        self.verify_ipv4_routing(
+            first_host, first_host_routed_ip,
+            second_host, second_host_routed_ip,
+            with_group_table=True)
+        self.swap_host_macs(first_host, second_host)
+        self.verify_ipv4_routing(
+            first_host, first_host_routed_ip,
+            second_host, second_host_routed_ip,
+            with_group_table=True)
+
+
+class FaucetSingleGroupUntaggedIPv6RouteTest(FaucetUntaggedTest):
+
+    CONFIG_GLOBAL = """
+vlans:
+    100:
+        description: "untagged"
+        faucet_vips: ["fc00::1:254/112"]
+        routes:
+            - route:
+                ip_dst: "fc00::10:0/112"
+                ip_gw: "fc00::1:1"
+            - route:
+                ip_dst: "fc00::20:0/112"
+                ip_gw: "fc00::1:2"
+            - route:
+                ip_dst: "fc00::30:0/112"
+                ip_gw: "fc00::1:2"
+"""
+
+    CONFIG = """
+        arp_neighbor_timeout: 2
+        max_resolve_backoff_time: 1
+        group_table: True
+        interfaces:
+            %(port_1)d:
+                native_vlan: 100
+                description: "b1"
+            %(port_2)d:
+                native_vlan: 100
+                description: "b2"
+            %(port_3)d:
+                native_vlan: 100
+                description: "b3"
+            %(port_4)d:
+                native_vlan: 100
+                description: "b4"
+"""
+
+    def test_untagged(self):
+        host_pair = self.net.hosts[:2]
+        first_host, second_host = host_pair
+        first_host_ip = ipaddress.ip_interface(u'fc00::1:1/112')
+        second_host_ip = ipaddress.ip_interface(u'fc00::1:2/112')
+        first_host_routed_ip = ipaddress.ip_interface(u'fc00::10:1/112')
+        second_host_routed_ip = ipaddress.ip_interface(u'fc00::20:1/112')
+        self.verify_ipv6_routing_pair(
+            first_host, first_host_ip, first_host_routed_ip,
+            second_host, second_host_ip, second_host_routed_ip,
+            with_group_table=True)
+        self.swap_host_macs(first_host, second_host)
+        self.verify_ipv6_routing_pair(
+            first_host, first_host_ip, first_host_routed_ip,
+            second_host, second_host_ip, second_host_routed_ip,
+            with_group_table=True)
+
+
+def import_hw_config():
     """Import configuration for physical switch testing."""
     try:
         with open(HW_SWITCH_CONFIG_FILE, 'r') as config_file:
             config = yaml.load(config_file)
     except:
-        print 'Could not load YAML config data from %s' % HW_SWITCH_CONFIG_FILE
+        print('Could not load YAML config data from %s' % HW_SWITCH_CONFIG_FILE)
         sys.exit(-1)
     if 'hw_switch' in config and config['hw_switch']:
-        required_config = ('dp_ports', 'dpid', 'of_port', 'gauge_of_port')
+        required_config = ('dp_ports', 'cpn_intf', 'dpid', 'of_port', 'gauge_of_port')
         for required_key in required_config:
             if required_key not in config:
-                print '%s must be specified in %s to use HW switch.' % (
-                    required_key, HW_SWITCH_CONFIG_FILE)
+                print('%s must be specified in %s to use HW switch.' % (
+                    required_key, HW_SWITCH_CONFIG_FILE))
                 sys.exit(-1)
         dp_ports = config['dp_ports']
         if len(dp_ports) != REQUIRED_TEST_PORTS:
-            print ('Exactly %u dataplane ports are required, '
-                   '%d are provided in %s.' %
-                   (REQUIRED_TEST_PORTS, len(dp_ports), HW_SWITCH_CONFIG_FILE))
+            print('Exactly %u dataplane ports are required, '
+                  '%d are provided in %s.' %
+                  (REQUIRED_TEST_PORTS, len(dp_ports), HW_SWITCH_CONFIG_FILE))
         return config
     else:
         return None
@@ -2236,60 +2783,104 @@ def check_dependencies():
             # Might have run successfully, need to parse output
             pass
         except OSError:
-            print 'could not run %s' % required_binary
+            print('could not run %s' % required_binary)
             return False
         present_match = re.search(binary_present_re, binary_output)
         if not present_match:
-            print '%s not present or did not return expected string %s' % (
-                required_binary, binary_present_re)
+            print('%s not present or did not return expected string %s' % (
+                required_binary, binary_present_re))
             return False
         if binary_version_re:
             version_match = re.search(binary_version_re, binary_output)
             if version_match is None:
-                print 'could not get version from %s (%s)' % (
-                    required_binary, binary_output)
+                print('could not get version from %s (%s)' % (
+                    required_binary, binary_output))
                 return False
             try:
                 binary_version = version_match.group(1)
             except ValueError:
-                print 'cannot parse version %s for %s' % (
-                    version_match, required_binary)
+                print('cannot parse version %s for %s' % (
+                    version_match, required_binary))
                 return False
             if version.parse(binary_version) < version.parse(binary_minversion):
-                print '%s version %s is less than required version %s' % (
-                    required_binary, binary_version, binary_minversion)
+                print('%s version %s is less than required version %s' % (
+                    required_binary, binary_version, binary_minversion))
                 return False
-            print '%s version is %s' % (required_binary, binary_version)
+            print('%s version is %s' % (required_binary, binary_version))
         else:
-            print '%s present (%s)' % (required_binary, binary_present_re)
+            print('%s present (%s)' % (required_binary, binary_present_re))
     return True
 
 
 def lint_check():
     """Run pylint on required source files."""
-    for faucet_src in FAUCET_LINT_SRCS:
+    for faucet_src in FAUCET_LINT_SRCS + FAUCET_TEST_LINT_SRCS:
         ret = subprocess.call(['pylint', '-E', faucet_src])
         if ret:
-            print 'lint of %s returns an error' % faucet_src
+            print(('pylint of %s returns an error' % faucet_src))
+            return False
+    for faucet_src in FAUCET_LINT_SRCS:
+        output_2to3 = subprocess.check_output([
+            '2to3', '--nofix=import', faucet_src],
+            stderr=open(os.devnull, 'wb'))
+        if output_2to3:
+            print(('2to3 of %s returns a diff (not python3 compatible)' % faucet_src))
+            print(output_2to3)
             return False
     return True
 
 
-def make_suite(tc_class, config):
+def make_suite(tc_class, hw_config, root_tmpdir, ports_sock):
     """Compose test suite based on test class names."""
     testloader = unittest.TestLoader()
     testnames = testloader.getTestCaseNames(tc_class)
     suite = unittest.TestSuite()
     for name in testnames:
-        suite.addTest(tc_class(name, config))
+        suite.addTest(tc_class(name, hw_config, root_tmpdir, ports_sock))
     return suite
 
 
-def run_tests(requested_test_classes, serial, config):
+def pipeline_superset_report(root_tmpdir):
+    ofchannel_logs = glob.glob(
+        os.path.join(root_tmpdir, '*/ofchannel.log'))
+    match_re = re.compile(
+        r'^.+types table: (\d+) match: (.+) instructions: (.+) actions: (.+)')
+    table_matches = collections.defaultdict(set)
+    table_instructions = collections.defaultdict(set)
+    table_actions = collections.defaultdict(set)
+    for log in ofchannel_logs:
+        for log_line in open(log).readlines():
+            match = match_re.match(log_line)
+            if match:
+                table, matches, instructions, actions = match.groups()
+                table = int(table)
+                table_matches[table].update(eval(matches))
+                table_instructions[table].update(eval(instructions))
+                table_actions[table].update(eval(actions))
+    print('')
+    for table in sorted(table_matches):
+        print('table: %u' % table)
+        print('  matches: %s' % sorted(table_matches[table]))
+        print('  table_instructions: %s' % sorted(table_instructions[table]))
+        print('  table_actions: %s' % sorted(table_actions[table]))
+
+
+def run_tests(requested_test_classes,
+              excluded_test_classes,
+              keep_logs,
+              serial,
+              hw_config):
     """Actually run the test suites, potentially in parallel."""
-    ports_server = threading.Thread(target=faucet_mininet_test_util.serve_ports)
+    if hw_config is not None:
+        print('Testing hardware, forcing test serialization')
+        serial = True
+    root_tmpdir = tempfile.mkdtemp(prefix='faucet-tests-')
+    ports_sock = os.path.join(root_tmpdir, 'ports-server')
+    ports_server = threading.Thread(
+        target=faucet_mininet_test_util.serve_ports, args=(ports_sock,))
     ports_server.setDaemon(True)
     ports_server.start()
+    sanity_tests = unittest.TestSuite()
     single_tests = unittest.TestSuite()
     parallel_tests = unittest.TestSuite()
     for name, obj in inspect.getmembers(sys.modules[__name__]):
@@ -2297,74 +2888,95 @@ def run_tests(requested_test_classes, serial, config):
             continue
         if requested_test_classes and name not in requested_test_classes:
             continue
+        if excluded_test_classes and name in excluded_test_classes:
+            continue
         if name.endswith('Test') and name.startswith('Faucet'):
-            print 'adding test %s' % name
-            test_suite = make_suite(obj, config)
-            if serial or name.startswith('FaucetSingle'):
-                single_tests.addTest(test_suite)
+            print('adding test %s' % name)
+            test_suite = make_suite(obj, hw_config, root_tmpdir, ports_sock)
+            if name.startswith('FaucetSanity'):
+                sanity_tests.addTest(test_suite)
             else:
-                parallel_tests.addTest(test_suite)
-    print 'running %u tests in parallel and %u tests serial' % (
-        parallel_tests.countTestCases(), single_tests.countTestCases())
-    results = []
-    if parallel_tests.countTestCases():
-        max_parallel_tests = min(parallel_tests.countTestCases(), MAX_PARALLEL_TESTS)
-        parallel_runner = unittest.TextTestRunner(verbosity=255)
-        parallel_suite = ConcurrentTestSuite(
-            parallel_tests, fork_for_tests(max_parallel_tests))
-        results.append(parallel_runner.run(parallel_suite))
-    # TODO: Tests that are serialized generally depend on hardcoded ports.
-    # Make them use dynamic ports.
-    if single_tests.countTestCases():
-        single_runner = unittest.TextTestRunner(verbosity=255)
-        results.append(single_runner.run(single_tests))
-    for result in results:
-        if not result.wasSuccessful():
-            print result.printErrors()
+                if serial or name.startswith('FaucetSingle'):
+                    single_tests.addTest(test_suite)
+                else:
+                    parallel_tests.addTest(test_suite)
+    all_successful = True
+    sanity_runner = unittest.TextTestRunner(verbosity=255, failfast=True)
+    sanity_result = sanity_runner.run(sanity_tests)
+    if sanity_result.wasSuccessful():
+        print('running %u tests in parallel and %u tests serial' % (
+            parallel_tests.countTestCases(), single_tests.countTestCases()))
+        results = []
+        if parallel_tests.countTestCases():
+            max_parallel_tests = min(parallel_tests.countTestCases(), MAX_PARALLEL_TESTS)
+            parallel_runner = unittest.TextTestRunner(verbosity=255)
+            parallel_suite = ConcurrentTestSuite(
+                parallel_tests, fork_for_tests(max_parallel_tests))
+            results.append(parallel_runner.run(parallel_suite))
+        # TODO: Tests that are serialized generally depend on hardcoded ports.
+        # Make them use dynamic ports.
+        if single_tests.countTestCases():
+            single_runner = unittest.TextTestRunner(verbosity=255)
+            results.append(single_runner.run(single_tests))
+        for result in results:
+            if not result.wasSuccessful():
+                all_successful = False
+                print(result.printErrors())
+        pipeline_superset_report(root_tmpdir)
+    else:
+        print('sanity tests failed - test environment not correct')
+
+    os.remove(ports_sock)
+    if not keep_logs and all_successful:
+        shutil.rmtree(root_tmpdir)
 
 
 def parse_args():
     """Parse command line arguments."""
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "cs", ["clean", "serial"])
+        opts, args = getopt.getopt(
+            sys.argv[1:], "cksx:", ["clean", "keep_logs", "serial"])
     except getopt.GetoptError as err:
-        print str(err)
+        print(str(err))
         sys.exit(2)
 
     clean = False
+    keep_logs = False
     serial = False
+    excluded_test_classes = []
 
-    for opt, _ in opts:
+    for opt, arg in opts:
         if opt in ('-c', '--clean'):
             clean = True
+        if opt in ('-k', '--keep_logs'):
+            keep_logs = True
         if opt in ('-s', '--serial'):
             serial = True
+        if opt == '-x':
+            excluded_test_classes.append(arg)
 
-    return (args, clean, serial)
+    return (args, clean, keep_logs, serial, excluded_test_classes)
 
 
 def test_main():
     """Test main."""
     setLogLevel('info')
-    args, clean, serial = parse_args()
+    args, clean, keep_logs, serial, excluded_test_classes = parse_args()
 
     if clean:
-        print ('Cleaning up test interfaces, processes and openvswitch '
-               'configuration from previous test runs')
+        print('Cleaning up test interfaces, processes and openvswitch '
+              'configuration from previous test runs')
         Cleanup.cleanup()
         sys.exit(0)
     if not check_dependencies():
-        print ('dependency check failed. check required library/binary '
-               'list in header of this script')
+        print('dependency check failed. check required library/binary '
+              'list in header of this script')
         sys.exit(-1)
     if not lint_check():
-        print 'pylint must pass with no errors'
+        print('pylint must pass with no errors')
         sys.exit(-1)
-    config = import_config()
-    if config is not None:
-        print 'Testing hardware, forcing test serialization'
-        serial = True
-    run_tests(args, serial, config)
+    hw_config = import_hw_config()
+    run_tests(args, excluded_test_classes, keep_logs, serial, hw_config)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,8 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 # Copyright (C) 2015 Brad Cowie, Christopher Lorier and Joe Stringer.
 # Copyright (C) 2015 Research and Innovation Advanced Network New Zealand Ltd.
+# Copyright (C) 2015--2017 The Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,14 +20,14 @@ import hashlib
 import logging
 import sys
 import os
-import ipaddr
+import ipaddress
 
 testdir = os.path.dirname(__file__)
-srcdir = '../src/ryu_faucet/org/onfsdn/faucet'
+srcdir = '../'
 sys.path.insert(0, os.path.abspath(os.path.join(testdir, srcdir)))
 
 import unittest
-from config_parser import dp_parser, watcher_parser
+from faucet.config_parser import dp_parser, watcher_parser
 
 class DistConfigTestCase(unittest.TestCase):
     def setUp(self):
@@ -50,7 +51,6 @@ class DistConfigTestCase(unittest.TestCase):
             'config/testgaugeconfig.yaml', logname)
 
     def test_hashes(self):
-        testconfig_yaml = os.path.realpath('config/testconfig.yaml')
         testconfigv2_yaml = os.path.realpath('config/testconfigv2.yaml')
         testconfigv2_dps_yaml = os.path.realpath('config/testconfigv2-dps.yaml')
         testconfigv2_vlans_yaml = os.path.realpath('config/testconfigv2-vlans.yaml')
@@ -78,28 +78,28 @@ class DistConfigTestCase(unittest.TestCase):
         switch2 = self.v2_dps_by_id[0xdeadbeef]
         self.assertEqual(switch1.stack['priority'], 1)
         self.assertEqual(
-             switch1.ports[7].stack['dp'], switch2)
+            switch1.ports[7].stack['dp'], switch2)
         self.assertEqual(
-             switch1.ports[7].stack['port'], switch2.ports[1])
+            switch1.ports[7].stack['port'], switch2.ports[1])
         self.assertEqual(
-             switch2.ports[1].stack['dp'], switch1)
+            switch2.ports[1].stack['dp'], switch1)
         self.assertEqual(
-             switch2.ports[1].stack['port'], switch1.ports[7])
+            switch2.ports[1].stack['port'], switch1.ports[7])
         self.assertEqual(
-             switch1.stack['root_dp'], switch1)
+            switch1.stack['root_dp'], switch1)
         self.assertEqual(
-             switch2.stack['root_dp'], switch1)
+            switch2.stack['root_dp'], switch1)
         self.assertEqual(
-             ['switch1', 'switch2'], switch1.shortest_path(switch2.name))
+            ['switch1', 'switch2'], switch1.shortest_path(switch2.name))
         self.assertEqual(
-             [], switch1.shortest_path_to_root())
+            [], switch1.shortest_path_to_root())
         self.assertEqual(
-             ['switch2', 'switch1'], switch2.shortest_path_to_root())
+            ['switch2', 'switch1'], switch2.shortest_path_to_root())
         self.assertEqual(
-             switch1.ports[7], switch1.shortest_path_port('switch2'))
+            switch1.ports[7], switch1.shortest_path_port('switch2'))
         edges = [edge for edge in switch1.stack['graph'].adjacency_iter()]
         self.assertEqual(
-             2, len(edges))
+            2, len(edges))
         edge_from_switch_a, edge_from_switch_z = edges
         _, edge_data_a = edge_from_switch_a
         _, edge_data_b = edge_from_switch_z
@@ -181,24 +181,24 @@ class DistConfigTestCase(unittest.TestCase):
         for dp in (self.v2_dp,):
             vlan = dp.vlans[41]
             self.assertIn(
-                ipaddr.IPNetwork('10.0.0.253/24'),
-                vlan.controller_ips
+                ipaddress.ip_interface(u'10.0.0.253/24'),
+                vlan.faucet_vips
                 )
             self.assertEquals(vlan.bgp_port, 9179)
             self.assertEquals(vlan.bgp_as, 1)
             self.assertEquals(vlan.bgp_routerid, '1.1.1.1')
-            self.assertEquals(vlan.bgp_neighbor_address, '127.0.0.1')
+            self.assertIn('127.0.0.1', vlan.bgp_neighbor_addresses)
             self.assertEquals(vlan.bgp_neighbor_as, 2)
             self.assertIn(
-                ipaddr.IPNetwork('10.0.1.0/24'),
+                ipaddress.ip_network(u'10.0.1.0/24'),
                 vlan.ipv4_routes
                 )
             self.assertIn(
-                ipaddr.IPNetwork('10.0.2.0/24'),
+                ipaddress.ip_network(u'10.0.2.0/24'),
                 vlan.ipv4_routes
                 )
             self.assertIn(
-                ipaddr.IPNetwork('10.0.3.0/24'),
+                ipaddress.ip_network(u'10.0.3.0/24'),
                 vlan.ipv4_routes
                 )
 

@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 """Base class for all FAUCET unit tests."""
 
@@ -6,11 +6,14 @@ import json
 import os
 import re
 import shutil
+import socket
+import tempfile
 import time
 import unittest
 import yaml
 
-import ipaddr
+import ipaddress
+import netifaces
 import requests
 
 from mininet.node import Controller
@@ -22,41 +25,113 @@ from ryu.ofproto import ofproto_v1_3 as ofp
 import faucet_mininet_test_util
 
 
-class FAUCET(Controller):
+class BaseFAUCET(Controller):
+
+    controller_intf = None
+    tmpdir = None
+
+    def _start_tcpdump(self):
+        tcpdump_args = ' '.join((
+            '-s 0',
+            '-e',
+            '-n',
+            '-U',
+            '-q',
+            '-i %s' % self.controller_intf,
+            '-w %s/%s-of.cap' % (self.tmpdir, self.name),
+            'tcp and port %u' % self.port,
+            '>/dev/null',
+            '2>/dev/null',
+        ))
+        self.cmd('tcpdump %s &' % tcpdump_args)
+
+    def _tls_cargs(self, ofctl_port, ctl_privkey, ctl_cert, ca_certs):
+        tls_cargs = []
+        for carg_val, carg_key in ((ctl_privkey, 'ctl-privkey'),
+                                   (ctl_cert, 'ctl-cert'),
+                                   (ca_certs, 'ca-certs')):
+            if carg_val:
+                tls_cargs.append(('--%s=%s' % (carg_key, carg_val)))
+        if tls_cargs:
+            tls_cargs.append(('--ofp-ssl-listen-port=%u' % ofctl_port))
+        return ' '.join(tls_cargs)
+
+    def start(self):
+        self._start_tcpdump()
+        super(BaseFAUCET, self).start()
+
+
+class FAUCET(BaseFAUCET):
     """Start a FAUCET controller."""
 
-    def __init__(self,
-                 name,
-                 cdir=faucet_mininet_test_util.FAUCET_DIR,
-                 command='ryu-manager ryu.app.ofctl_rest faucet.py',
-                 cargs='--ofp-tcp-listen-port=%s --verbose --use-stderr',
-                 **kwargs):
+    def __init__(self, name, tmpdir, controller_intf,
+                 ctl_privkey, ctl_cert, ca_certs,
+                 ports_sock, port, **kwargs):
         name = 'faucet-%u' % os.getpid()
-        self.ofctl_port, _ = faucet_mininet_test_util.find_free_port()
-        cargs = '--wsapi-port=%u %s' % (self.ofctl_port, cargs)
+        self.tmpdir = tmpdir
+        self.controller_intf = controller_intf
+        # pylint: disable=no-member
+        self.controller_ipv4 = netifaces.ifaddresses(
+            self.controller_intf)[socket.AF_INET][0]['addr']
+        self.ofctl_port, _ = faucet_mininet_test_util.find_free_port(
+            ports_sock)
+        command = 'PYTHONPATH=../ ryu-manager ryu.app.ofctl_rest faucet.faucet'
+        cargs = ' '.join((
+            '--verbose',
+            '--use-stderr',
+            '--wsapi-host=127.0.0.1',
+            '--wsapi-port=%u' % self.ofctl_port,
+            '--ofp-listen-host=%s' % self.controller_ipv4,
+            '--ofp-tcp-listen-port=%s',
+            self._tls_cargs(port, ctl_privkey, ctl_cert, ca_certs)))
         Controller.__init__(
             self,
             name,
-            cdir=cdir,
+            cdir=faucet_mininet_test_util.FAUCET_DIR,
             command=command,
             cargs=cargs,
+            port=port,
             **kwargs)
 
 
-class Gauge(Controller):
+class Gauge(BaseFAUCET):
     """Start a Gauge controller."""
 
-    def __init__(self,
-                 name,
-                 cdir=faucet_mininet_test_util.FAUCET_DIR,
-                 command='ryu-manager gauge.py',
-                 cargs='--ofp-tcp-listen-port=%s --verbose --use-stderr',
-                 **kwargs):
+    def __init__(self, name, tmpdir, controller_intf,
+                 ctl_privkey, ctl_cert, ca_certs,
+                 port, **kwargs):
         name = 'gauge-%u' % os.getpid()
+        self.tmpdir = tmpdir
+        self.controller_intf = controller_intf
+        command = 'PYTHONPATH=../ ryu-manager faucet.gauge'
+        cargs = ' '.join((
+            '--verbose',
+            '--use-stderr',
+            '--ofp-tcp-listen-port=%s',
+            self._tls_cargs(port, ctl_privkey, ctl_cert, ca_certs)))
         Controller.__init__(
             self,
             name,
-            cdir=cdir,
+            cdir=faucet_mininet_test_util.FAUCET_DIR,
+            command=command,
+            cargs=cargs,
+            port=port,
+            **kwargs)
+
+
+class FaucetAPI(Controller):
+    '''Start a controller to run the Faucet API tests.'''
+
+    def __init__(self, name, **kwargs):
+        name = 'faucet-api-%u' % os.getpid()
+        command = 'PYTHONPATH=../ ryu-manager faucet.faucet test_api.py'
+        cargs = ' '.join((
+            '--verbose',
+            '--use-stderr',
+            '--ofp-tcp-listen-port=%s'))
+        Controller.__init__(
+            self,
+            name,
             command=command,
             cargs=cargs,
             **kwargs)
@@ -119,8 +194,8 @@ class FaucetSwitchTopo(Topo):
             listenPort=port,
             dpid=faucet_mininet_test_util.mininet_dpid(dpid))
 
-    def build(self, dpid=0, n_tagged=0, tagged_vid=100, n_untagged=0):
-        port, ports_served = faucet_mininet_test_util.find_free_port()
+    def build(self, ports_sock, dpid=0, n_tagged=0, tagged_vid=100, n_untagged=0):
+        port, ports_served = faucet_mininet_test_util.find_free_port(ports_sock)
         sid_prefix = self._get_sid_prefix(ports_served)
         for host_n in range(n_tagged):
             self._add_tagged_host(sid_prefix, tagged_vid, host_n)
@@ -134,15 +209,17 @@ class FaucetSwitchTopo(Topo):
 class FaucetHwSwitchTopo(FaucetSwitchTopo):
     """FAUCET switch topology that contains a hardware switch."""
 
-    def build(self, dpid=0, n_tagged=0, tagged_vid=100, n_untagged=0):
-        port, ports_served = faucet_mininet_test_util.find_free_port()
+    def build(self, ports_sock, dpid=0, n_tagged=0, tagged_vid=100, n_untagged=0):
+        port, ports_served = faucet_mininet_test_util.find_free_port(ports_sock)
         sid_prefix = self._get_sid_prefix(ports_served)
         for host_n in range(n_tagged):
             self._add_tagged_host(sid_prefix, tagged_vid, host_n)
         for host_n in range(n_untagged):
             self._add_untagged_host(sid_prefix, host_n)
-        dpid = str(int(dpid) + 1)
-        print 'remap switch will use DPID %s (%x)' % (dpid, int(dpid))
+        remap_dpid = str(int(dpid) + 1)
+        print('bridging hardware switch DPID %s (%x) dataplane via OVS DPID %s (%x)' % (
+            dpid, int(dpid), remap_dpid, int(remap_dpid)))
+        dpid = remap_dpid
         switch = self._add_faucet_switch(sid_prefix, port, dpid)
         for host in self.hosts():
             self.addLink(host, switch)
@@ -152,12 +229,15 @@ class FaucetTestBase(unittest.TestCase):
     """Base class for all FAUCET unit tests."""
 
     ONE_GOOD_PING = '1 packets transmitted, 1 received, 0% packet loss'
-    CONTROLLER_IPV4 = ipaddr.IPv4Network('10.0.0.254/24')
-    CONTROLLER_IPV4_2 = ipaddr.IPv4Network('172.16.0.254/24')
-    CONTROLLER_IPV6 = ipaddr.IPv6Network('fc00::1:254/64')
-    CONTROLLER_IPV6_2 = ipaddr.IPv6Network('fc01::1:254/64')
+    FAUCET_VIPV4 = ipaddress.ip_interface(u'10.0.0.254/24')
+    FAUCET_VIPV4_2 = ipaddress.ip_interface(u'172.16.0.254/24')
+    FAUCET_VIPV6 = ipaddress.ip_interface(u'fc00::1:254/64')
+    FAUCET_VIPV6_2 = ipaddress.ip_interface(u'fc01::1:254/64')
     OFCTL = 'ovs-ofctl -OOpenFlow13'
     BOGUS_MAC = '01:02:03:04:05:06'
+    FAUCET_MAC = '0e:00:00:00:00:01'
+    LADVD = 'timeout 30s ladvd -e lo -f'
+
     CONFIG = ''
     CONFIG_GLOBAL = ''
 
@@ -168,19 +248,43 @@ class FaucetTestBase(unittest.TestCase):
     gauge_of_port = None
     net = None
     of_port = None
+    ctl_privkey = None
+    ctl_cert = None
+    ca_certs = None
     port_map = {'port_1': 1, 'port_2': 2, 'port_3': 3, 'port_4': 4}
     switch_map = {}
     tmpdir = None
 
-    def __init__(self, name, config):
+    def __init__(self, name, config, root_tmpdir, ports_sock):
         super(FaucetTestBase, self).__init__(name)
         self.config = config
+        self.root_tmpdir = root_tmpdir
+        self.ports_sock = ports_sock
+
+    def tmpdir_name(self):
+        test_name = '-'.join(self.id().split('.')[1:])
+        return tempfile.mkdtemp(
+            prefix='%s-' % test_name, dir=self.root_tmpdir)
 
     def tearDown(self):
         """Clean up after a test."""
+        # must not be any controller exception.
+        self.assertEquals(
+            0, os.path.getsize(os.environ['FAUCET_EXCEPTION_LOG']))
+        controller_names = []
+        for controller in self.net.controllers:
+            controller_names.append(controller.name)
         if self.net is not None:
             self.net.stop()
-        shutil.rmtree(self.tmpdir)
+        for _, debug_log in self.get_ofchannel_logs():
+            self.assertFalse(
+                re.search('OFPErrorMsg', open(debug_log).read()),
+                msg='debug log has OFPErrorMsgs')
+        # Associate controller log with test results, if we are keeping
+        # the temporary directory, or effectively delete it if not.
+        # mininet doesn't have a way to change its log name for the controller.
+        for controller_name in controller_names:
+            shutil.move('/tmp/%s.log' % controller_name, self.tmpdir)
 
     def pre_start_net(self):
         """Hook called after Mininet initializtion, before Mininet started."""
@@ -198,16 +302,9 @@ dps:
         hardware: "%s"
 """ % (config_global, debug_log, int(dpid), hardware)
 
-    def get_gauge_config(self, faucet_config_file,
-                         monitor_stats_file,
-                         monitor_state_file,
-                         monitor_flow_table_file):
-        """Build Gauge config."""
+
+    def get_gauge_watcher_config(self):
         return """
-version: 2
-faucet_configs:
-    - %s
-watchers:
     port_stats:
         dps: ['faucet-1']
         type: 'port_stats'
@@ -223,6 +320,20 @@ watchers:
         type: 'flow_table'
         interval: 5
         db: 'flow_file'
+"""
+
+    def get_gauge_config(self, faucet_config_file,
+                         monitor_stats_file,
+                         monitor_state_file,
+                         monitor_flow_table_file,
+                         influx_port):
+        """Build Gauge config."""
+        return """
+version: 2
+faucet_configs:
+    - %s
+watchers:
+    %s
 dbs:
     stats_file:
         type: 'text'
@@ -233,8 +344,20 @@ dbs:
     flow_file:
         type: 'text'
         file: %s
-""" % (faucet_config_file, monitor_stats_file,
-       monitor_state_file, monitor_flow_table_file)
+    influx:
+        type: 'influx'
+        influx_db: 'faucet'
+        influx_host: 'localhost'
+        influx_port: %u
+        influx_user: 'faucet'
+        influx_pwd: ''
+        influx_timeout: 10
+""" % (faucet_config_file,
+       self.get_gauge_watcher_config(),
+       monitor_stats_file,
+       monitor_state_file,
+       monitor_flow_table_file,
+       influx_port)
 
     def get_controller(self):
         """Return the first (only) controller."""
@@ -243,6 +366,43 @@ dbs:
     def ofctl_rest_url(self):
         """Return control URL for Ryu ofctl module."""
         return 'http://127.0.0.1:%u' % self.get_controller().ofctl_port
+
+    def get_all_groups_desc_from_dpid(self, dpid, timeout=2):
+        int_dpid = faucet_mininet_test_util.str_int_dpid(dpid)
+        for _ in range(timeout):
+            try:
+                ofctl_result = json.loads(requests.get(
+                    '%s/stats/groupdesc/%s' % (self.ofctl_rest_url(),
+                                               int_dpid)).text)
+                flow_dump = ofctl_result[int_dpid]
+                return [json.dumps(flow) for flow in flow_dump]
+            except (ValueError, requests.exceptions.ConnectionError):
+                # Didn't get valid JSON, try again
+                time.sleep(1)
+                continue
+        return []
+
+    def get_group_id_for_matching_flow(self, exp_flow, timeout=10):
+        for _ in range(timeout):
+            flow_dump = self.get_all_flows_from_dpid(self.dpid, timeout)
+            for flow in flow_dump:
+                if re.search(exp_flow, flow):
+                    flow = json.loads(flow)
+                    group_id = int(re.findall(r'\d+', str(flow['actions']))[0])
+                    return group_id
+            time.sleep(1)
+        self.fail(
+            'Cannot find group_id for matching flow %s' % exp_flow)
+
+    def wait_matching_in_group_table(self, exp_flow, group_id, timeout=10):
+        exp_group = '%s.+"group_id": %d' % (exp_flow, group_id)
+        for _ in range(timeout):
+            group_dump = self.get_all_groups_desc_from_dpid(self.dpid, 1)
+            for group_desc in group_dump:
+                if re.search(exp_group, group_desc):
+                    return True
+            time.sleep(1)
+        return False
 
     def get_all_flows_from_dpid(self, dpid, timeout=10):
         """Return all flows from DPID."""
@@ -310,7 +470,7 @@ dbs:
         ping_cmd = 'ping'
         if not host_ip_net:
             host_ip_net = self.host_ipv6(host)
-        broadcast = (ipaddr.IPNetwork(host_ip_net).broadcast)
+        broadcast = (ipaddress.ip_interface(unicode(host_ip_net)).network.broadcast_address)
         if broadcast.version == 6:
             ping_cmd = 'ping6'
         for _ in range(retries):
@@ -320,11 +480,19 @@ dbs:
             host.cmd('%s -i 0.2 -c 1 -b %s' % (ping_cmd, broadcast))
         self.fail('host %s could not be learned' % host)
 
+    def get_ofchannel_logs(self):
+        config = yaml.load(open(os.environ['FAUCET_CONFIG']))
+        ofchannel_logs = []
+        for dp_name, dp_config in config['dps'].items():
+            if 'ofchannel_log' in dp_config:
+                debug_log = dp_config['ofchannel_log']
+                ofchannel_logs.append((dp_name, debug_log))
+        return ofchannel_logs
+
     def wait_debug_log(self):
         """Require all switches to have exchanged flows with controller."""
-        config = yaml.load(open(os.environ['FAUCET_CONFIG']))
-        for dp_name, dp_config in config['dps'].iteritems():
-            debug_log = dp_config['ofchannel_log']
+        ofchannel_logs = self.get_ofchannel_logs()
+        for dp_name, debug_log in ofchannel_logs:
             debug_log_present = False
             for _ in range(20):
                 if (os.path.exists(debug_log) and
@@ -359,7 +527,7 @@ dbs:
 
     def flap_all_switch_ports(self, flap_time=1):
         """Flap all ports on switch."""
-        for port_no in self.port_map.itervalues():
+        for port_no in self.port_map.values():
             os.system(self.curl_portmod(
                 self.dpid,
                 port_no,
@@ -378,23 +546,19 @@ dbs:
             '',
             host.cmd('ip -6 addr add %s dev %s' % (ip_v6, host.intf())))
 
-    def add_host_ipv6_route(self, host, ip_dst, ip_gw):
-        """Add an IPv6 route to a Mininet host."""
-        host.cmd('ip -6 route del %s' % ip_dst.masked())
+    def add_host_route(self, host, ip_dst, ip_gw):
+        """Add an IP route to a Mininet host."""
+        host.cmd('ip -%u route del %s' % (
+            ip_dst.version, ip_dst.network.with_prefixlen))
         self.assertEquals(
             '',
-            host.cmd('ip -6 route add %s via %s' % (ip_dst.masked(), ip_gw)))
+            host.cmd('ip -%u route add %s via %s' % (
+                ip_dst.version, ip_dst.network.with_prefixlen, ip_gw)))
 
-    def add_host_ipv4_route(self, host, ip_dst, ip_gw):
-        """Add an IPv4 route to a Mininet host."""
-        host.cmd('ip -4 route del %s' % ip_dst.masked())
-        self.assertEquals(
-            '',
-            host.cmd('ip -4 route add %s via %s' % (ip_dst.masked(), ip_gw)))
-
-    def one_ipv4_ping(self, host, dst, retries=3):
+    def one_ipv4_ping(self, host, dst, retries=3, require_host_learned=True):
         """Ping an IPv4 destination from a host."""
-        self.require_host_learned(host)
+        if require_host_learned:
+            self.require_host_learned(host)
         for _ in range(retries):
             ping_result = host.cmd('ping -c1 %s' % dst)
             if re.search(self.ONE_GOOD_PING, ping_result):
@@ -403,7 +567,9 @@ dbs:
 
     def one_ipv4_controller_ping(self, host):
         """Ping the controller from a host with IPv4."""
-        self.one_ipv4_ping(host, self.CONTROLLER_IPV4.ip)
+        self.one_ipv4_ping(host, self.FAUCET_VIPV4.ip)
+        self.verify_ipv4_host_learned_mac(
+            host, self.FAUCET_VIPV4.ip, self.FAUCET_MAC)
 
     def one_ipv6_ping(self, host, dst, retries=3):
         """Ping an IPv6 destination from a host."""
@@ -417,7 +583,9 @@ dbs:
 
     def one_ipv6_controller_ping(self, host):
         """Ping the controller from a host with IPv6."""
-        self.one_ipv6_ping(host, self.CONTROLLER_IPV6.ip)
+        self.one_ipv6_ping(host, self.FAUCET_VIPV6.ip)
+        self.verify_ipv6_host_learned_mac(
+            host, self.FAUCET_VIPV6.ip, self.FAUCET_MAC)
 
     def wait_for_tcp_listen(self, host, port, timeout=10):
         """Wait for a host to start listening on a port."""
@@ -464,13 +632,13 @@ dbs:
         exabgp_log = os.path.join(self.tmpdir, 'exabgp.log')
         exabgp_err = os.path.join(self.tmpdir, 'exabgp.err')
         exabgp_env = ' '.join((
-             'exabgp.tcp.bind="%s"' % listen_address,
-             'exabgp.tcp.port=%u' % port,
-             'exabgp.log.all=true',
-             'exabgp.log.routes=true',
-             'exabgp.log.rib=true',
-             'exabgp.log.packets=true',
-             'exabgp.log.parser=true',
+            'exabgp.tcp.bind="%s"' % listen_address,
+            'exabgp.tcp.port=%u' % port,
+            'exabgp.log.all=true',
+            'exabgp.log.routes=true',
+            'exabgp.log.rib=true',
+            'exabgp.log.packets=true',
+            'exabgp.log.parser=true',
         ))
         open(exabgp_conf_file, 'w').write(exabgp_conf)
         controller = self.get_controller()
@@ -528,64 +696,105 @@ dbs:
                 return
         self.assertEquals(0, loss)
 
-    def wait_for_route_as_flow(self, nexthop, prefix, timeout=5):
+    def wait_for_route_as_flow(self, nexthop, prefix, timeout=10,
+                               with_group_table=False):
         """Verify a route has been added as a flow."""
+        exp_prefix = '%s/%s' % (
+            prefix.network_address, prefix.netmask)
         if prefix.version == 6:
-            exp_prefix = '/'.join(
-                (str(prefix.masked().ip), str(prefix.netmask)))
             nw_dst_match = '"ipv6_dst": "%s"' % exp_prefix
         else:
-            exp_prefix = prefix.masked().with_netmask
             nw_dst_match = '"nw_dst": "%s"' % exp_prefix
-        self.wait_until_matching_flow(
-            'SET_FIELD: {eth_dst:%s}.+%s' % (nexthop, nw_dst_match), timeout)
+        if with_group_table:
+            group_id = self.get_group_id_for_matching_flow(nw_dst_match)
+            self.wait_matching_in_group_table(
+                'SET_FIELD: {eth_dst:%s}' % nexthop,
+                group_id, timeout)
+        else:
+            self.wait_until_matching_flow(
+                'SET_FIELD: {eth_dst:%s}.+%s' % (nexthop, nw_dst_match), timeout)
 
     def host_ipv4_alias(self, host, alias_ip):
         """Add an IPv4 alias address to a host."""
-        del_cmd = 'ip addr del %s/%s dev %s' % (
-            alias_ip.ip, alias_ip.prefixlen, host.intf())
-        add_cmd = 'ip addr add %s/%s dev %s label %s:1' % (
-            alias_ip.ip, alias_ip.prefixlen, host.intf(), host.intf())
+        del_cmd = 'ip addr del %s dev %s' % (
+            alias_ip.with_prefixlen, host.intf())
+        add_cmd = 'ip addr add %s dev %s label %s:1' % (
+            alias_ip.with_prefixlen, host.intf(), host.intf())
         host.cmd(del_cmd)
         self.assertEquals('', host.cmd(add_cmd))
 
+    def _verify_host_learned_mac(self, host, ip, ip_ver, mac, retries):
+        for _ in range(retries):
+            learned_mac = host.cmd(
+                "ip -%u neighbor show %s | awk '{ print $5 }'" % (ip_ver, ip)).strip()
+            if learned_mac:
+                break
+            time.sleep(1)
+        self.assertEqual(
+            mac, learned_mac,
+            msg='MAC learned on host mismatch (expected %s found %s)' % (
+                mac, learned_mac))
+
+    def verify_ipv4_host_learned_mac(self, host, ip, mac, retries=3):
+        self._verify_host_learned_mac(host, ip, 4, mac, retries)
+
+    def verify_ipv4_host_learned_host(self, host, learned_host):
+        learned_ip = ipaddress.ip_interface(unicode(self.host_ipv4(learned_host)))
+        self.verify_ipv4_host_learned_mac(host, learned_ip.ip, learned_host.MAC())
+
+    def verify_ipv6_host_learned_mac(self, host, ip6, mac, retries=3):
+        self._verify_host_learned_mac(host, ip6, 6, mac, retries)
+
+    def verify_ipv6_host_learned_host(self, host, learned_host):
+        learned_ip6 = ipaddress.ip_interface(unicode(self.host_ipv6(learned_host)))
+        self.verify_ipv6_host_learned_mac(host, learned_ip6.ip, learned_host.MAC())
+
     def verify_ipv4_routing(self, first_host, first_host_routed_ip,
-                            second_host, second_host_routed_ip):
+                            second_host, second_host_routed_ip,
+                            with_group_table=False):
         """Verify one host can IPV4 route to another via FAUCET."""
         self.host_ipv4_alias(first_host, first_host_routed_ip)
         self.host_ipv4_alias(second_host, second_host_routed_ip)
-        self.add_host_ipv4_route(
-            first_host, second_host_routed_ip, self.CONTROLLER_IPV4.ip)
-        self.add_host_ipv4_route(
-            second_host, first_host_routed_ip, self.CONTROLLER_IPV4.ip)
+        self.add_host_route(
+            first_host, second_host_routed_ip, self.FAUCET_VIPV4.ip)
+        self.add_host_route(
+            second_host, first_host_routed_ip, self.FAUCET_VIPV4.ip)
         self.net.ping(hosts=(first_host, second_host))
         self.wait_for_route_as_flow(
-            first_host.MAC(), first_host_routed_ip)
+            first_host.MAC(), first_host_routed_ip.network,
+            with_group_table=with_group_table)
         self.wait_for_route_as_flow(
-            second_host.MAC(), second_host_routed_ip)
+            second_host.MAC(), second_host_routed_ip.network,
+            with_group_table=with_group_table)
         self.one_ipv4_ping(first_host, second_host_routed_ip.ip)
         self.one_ipv4_ping(second_host, first_host_routed_ip.ip)
+        self.verify_ipv4_host_learned_host(first_host, second_host)
+        self.verify_ipv4_host_learned_host(second_host, first_host)
 
-    def verify_ipv4_routing_mesh(self):
+    def verify_ipv4_routing_mesh(self, with_group_table=False):
         """Verify hosts can route to each other via FAUCET."""
         host_pair = self.net.hosts[:2]
         first_host, second_host = host_pair
-        first_host_routed_ip = ipaddr.IPv4Network('10.0.1.1/24')
-        second_host_routed_ip = ipaddr.IPv4Network('10.0.2.1/24')
-        second_host_routed_ip2 = ipaddr.IPv4Network('10.0.3.1/24')
+        first_host_routed_ip = ipaddress.ip_interface(u'10.0.1.1/24')
+        second_host_routed_ip = ipaddress.ip_interface(u'10.0.2.1/24')
+        second_host_routed_ip2 = ipaddress.ip_interface(u'10.0.3.1/24')
         self.verify_ipv4_routing(
             first_host, first_host_routed_ip,
-            second_host, second_host_routed_ip)
+            second_host, second_host_routed_ip,
+            with_group_table=with_group_table)
         self.verify_ipv4_routing(
             first_host, first_host_routed_ip,
-            second_host, second_host_routed_ip2)
+            second_host, second_host_routed_ip2,
+            with_group_table=with_group_table)
         self.swap_host_macs(first_host, second_host)
         self.verify_ipv4_routing(
             first_host, first_host_routed_ip,
-            second_host, second_host_routed_ip)
+            second_host, second_host_routed_ip,
+            with_group_table=with_group_table)
         self.verify_ipv4_routing(
             first_host, first_host_routed_ip,
-            second_host, second_host_routed_ip2)
+            second_host, second_host_routed_ip2,
+            with_group_table=with_group_table)
 
     def setup_ipv6_hosts_addresses(self, first_host, first_host_ip,
                                    first_host_routed_ip, second_host,
@@ -602,53 +811,73 @@ dbs:
 
     def verify_ipv6_routing(self, first_host, first_host_ip,
                             first_host_routed_ip, second_host,
-                            second_host_ip, second_host_routed_ip):
+                            second_host_ip, second_host_routed_ip,
+                            with_group_table=False):
         """Verify one host can IPV6 route to another via FAUCET."""
         self.one_ipv6_ping(first_host, second_host_ip.ip)
         self.one_ipv6_ping(second_host, first_host_ip.ip)
-        self.add_host_ipv6_route(
-            first_host, second_host_routed_ip, self.CONTROLLER_IPV6.ip)
-        self.add_host_ipv6_route(
-            second_host, first_host_routed_ip, self.CONTROLLER_IPV6.ip)
+        self.add_host_route(
+            first_host, second_host_routed_ip, self.FAUCET_VIPV6.ip)
+        self.add_host_route(
+            second_host, first_host_routed_ip, self.FAUCET_VIPV6.ip)
         self.wait_for_route_as_flow(
-            first_host.MAC(), first_host_routed_ip)
+            first_host.MAC(), first_host_routed_ip.network,
+            with_group_table=with_group_table)
         self.wait_for_route_as_flow(
-            second_host.MAC(), second_host_routed_ip)
+            second_host.MAC(), second_host_routed_ip.network,
+            with_group_table=with_group_table)
         self.one_ipv6_controller_ping(first_host)
         self.one_ipv6_controller_ping(second_host)
         self.one_ipv6_ping(first_host, second_host_routed_ip.ip)
         self.one_ipv6_ping(second_host, first_host_routed_ip.ip)
+        self.verify_ipv6_host_learned_mac(
+            first_host, second_host_ip.ip, second_host.MAC())
+        self.verify_ipv6_host_learned_mac(
+            second_host, first_host_ip.ip, first_host.MAC())
 
     def verify_ipv6_routing_pair(self, first_host, first_host_ip,
                                  first_host_routed_ip, second_host,
-                                 second_host_ip, second_host_routed_ip):
+                                 second_host_ip, second_host_routed_ip,
+                                 with_group_table=False):
         """Verify hosts can route IPv6 to each other via FAUCET."""
         self.setup_ipv6_hosts_addresses(
             first_host, first_host_ip, first_host_routed_ip,
             second_host, second_host_ip, second_host_routed_ip)
         self.verify_ipv6_routing(
             first_host, first_host_ip, first_host_routed_ip,
-            second_host, second_host_ip, second_host_routed_ip)
+            second_host, second_host_ip, second_host_routed_ip,
+            with_group_table=with_group_table)
 
-    def verify_ipv6_routing_mesh(self):
+    def verify_ipv6_routing_mesh(self, with_group_table=False):
         """Verify IPv6 routing between hosts and multiple subnets."""
         host_pair = self.net.hosts[:2]
         first_host, second_host = host_pair
-        first_host_ip = ipaddr.IPv6Network('fc00::1:1/112')
-        second_host_ip = ipaddr.IPv6Network('fc00::1:2/112')
-        first_host_routed_ip = ipaddr.IPv6Network('fc00::10:1/112')
-        second_host_routed_ip = ipaddr.IPv6Network('fc00::20:1/112')
-        second_host_routed_ip2 = ipaddr.IPv6Network('fc00::30:1/112')
+        first_host_ip = ipaddress.ip_interface(u'fc00::1:1/112')
+        second_host_ip = ipaddress.ip_interface(u'fc00::1:2/112')
+        first_host_routed_ip = ipaddress.ip_interface(u'fc00::10:1/112')
+        second_host_routed_ip = ipaddress.ip_interface(u'fc00::20:1/112')
+        second_host_routed_ip2 = ipaddress.ip_interface(u'fc00::30:1/112')
         self.verify_ipv6_routing_pair(
             first_host, first_host_ip, first_host_routed_ip,
-            second_host, second_host_ip, second_host_routed_ip)
+            second_host, second_host_ip, second_host_routed_ip,
+            with_group_table=with_group_table)
         self.verify_ipv6_routing_pair(
             first_host, first_host_ip, first_host_routed_ip,
-            second_host, second_host_ip, second_host_routed_ip2)
+            second_host, second_host_ip, second_host_routed_ip2,
+            with_group_table=with_group_table)
         self.swap_host_macs(first_host, second_host)
         self.verify_ipv6_routing_pair(
             first_host, first_host_ip, first_host_routed_ip,
-            second_host, second_host_ip, second_host_routed_ip)
+            second_host, second_host_ip, second_host_routed_ip,
+            with_group_table=with_group_table)
         self.verify_ipv6_routing_pair(
             first_host, first_host_ip, first_host_routed_ip,
-            second_host, second_host_ip, second_host_routed_ip2)
+            second_host, second_host_ip, second_host_routed_ip2,
+            with_group_table=with_group_table)
+
+    def verify_invalid_bgp_route(self, pattern):
+        """Check if we see the pattern in Faucet's Log"""
+        controller = self.get_controller()
+        count = controller.cmd(
+            'grep -c "%s" %s' % (pattern, os.environ['FAUCET_LOG']))
+        self.assertGreater(count, 0)

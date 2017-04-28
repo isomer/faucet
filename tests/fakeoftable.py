@@ -1,4 +1,5 @@
 # Copyright (C) 2015 Research and Innovation Advanced Network New Zealand Ltd.
+# Copyright (C) 2015--2017 The Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -243,7 +244,7 @@ class FlowMod(object):
            flowmod.out_port != ofp.OFPP_ANY:
             self.out_port = flowmod.out_port
 
-        for key, v in flowmod.match.iteritems():
+        for key, v in flowmod.match.items():
             if isinstance(v, tuple):
                 val, mask = v
             else:
@@ -279,7 +280,7 @@ class FlowMod(object):
         """
 
         #TODO: add cookie and out_group
-        for key, val in self.match_values.iteritems():
+        for key, val in self.match_values.items():
             if key not in pkt_dict:
                 return False
             else:
@@ -306,7 +307,7 @@ class FlowMod(object):
                    self.match_values == other.match_values and\
                    self.match_masks == other.match_masks
         else:
-            for key, val in self.match_values.iteritems():
+            for key, val in self.match_values.items():
                 if key not in other.match_values:
                     return False
                 else:
@@ -322,7 +323,7 @@ class FlowMod(object):
         # potentially an overlap and therefore is considered success
         if other.priority != self.priority:
             return False
-        for k, v in self.match_values.iteritems():
+        for k, v in self.match_values.items():
             if k in other.match_values:
                 if v & other.match_masks[k] != other.match_values[k]:
                     return False
@@ -374,7 +375,7 @@ class FlowMod(object):
 
     def __str__(self):
         string = 'priority: {0}'.format(self.priority)
-        for key, val in self.match_values.iteritems():
+        for key, val in self.match_values.items():
             mask = self.match_masks[key]
             string += ' {0}: {1}'.format(key, val)
             if mask.int != -1:

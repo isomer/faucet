@@ -1,5 +1,4 @@
-:version: 1.3.2
-:copyright: 2015 `REANNZ <http://www.reannz.co.nz/>`_.  All Rights Reserved.
+:version: 1.4.0
 
 .. meta::
    :keywords: OpenFlow, Ryu, Faucet, VLAN, SDN
@@ -22,7 +21,7 @@ It supports:
 - BGP advertisement of controller IPs and static routes and Quagga support
 - Policy based forwarding to offload processing to external systems (Eg 802.1x via hostapd)
 - Support for IPv4 and IPv6 static routes on both tagged and untagged VLANs
-- Integrated support for InfluxDB/Grafana
+- Integrated support for stats via InfluxDB/Grafana and flows via CouchDB/CouchApp
 - Comprehensive Test suite - tests for all features that can be run against mininet (development) and on hardware; Most tests run in parallel to reduce time.
 - Code: Python based, easy readability (PEP8 style), documented, Unit tests for all features
 - Installation: `Python pip <#installation-with-pip>`_, `pre-built VM available <https://susestudio.com/a/ENQFFD/ryu-faucet>`_, `Docker containers <#installation-with-docker>`_
@@ -61,19 +60,19 @@ Supports any ACL rule that `ofctl_v1_3.py <https://github.com/osrg/ryu/blob/mast
           - rule:
               nw_dst: "172.0.0.0/8"
               dl_type: 0x800
-              allow: 1
+              actions:
+                  allow: 1
 
           - rule:
               dl_type: 0x0806
-              allow: 1
+              actions:
+                  allow: 1
 
           - rule:
               nw_dst: "10.0.0.0/16"
               dl_type: 0x800
-              allow: 0
-
-          - rule:
-
+              actions:
+                  allow: 0
 
 
 Unicast Flood
@@ -132,16 +131,19 @@ Version 2 of the Faucet configuration file format allows multiple datapaths (swi
           - rule:
               nw_dst: "172.0.0.0/8"
               dl_type: 0x800
-              allow: 1
+              actions:
+                  allow: 1
 
           - rule:
               dl_type: 0x0806
-              allow: 1
+              actions:
+                  allow: 1
 
           - rule:
               nw_dst: "10.0.0.0/16"
               dl_type: 0x800
-              allow: 0
+              actions:
+                  allow: 0
 
 Extra DP, VLAN or ACL data can also be separated into different files and included into the main configuration file, as shown below. The ``include`` field is used for configuration files which are required to be loaded, and Faucet will log an error if there was a problem while loading a file. Files listed on ``include-optional`` will simply be skipped and a warning will be logged instead.
 
@@ -189,8 +191,8 @@ You have run this as ``root`` or use ``sudo``
 .. code:: bash
 
   apt-get install python-dev # Required for Ubuntu
-  pip install ryu-faucet
-  pip show -f ryu-faucet
+  pip install faucet
+  pip show -f faucet
 
 Optional Install for Network Monitoring Dashboard
 -------------------------------------------------
@@ -203,7 +205,7 @@ To Uninstall the package
 
 .. code:: bash
 
-  pip uninstall ryu-faucet
+  pip uninstall faucet
 
 ========================
 Installation with docker
@@ -229,17 +231,7 @@ For more advanced documentation on running Faucet with docker please read ``READ
 ============
 Architecture
 ============
-.. image:: src/docs/faucet_architecture.png
-
-==========
-Deployment
-==========
-.. image:: src/docs/faucet_deployment.png
-
-Deployment at Open Networking Foundation
-----------------------------------------
-.. image:: src/docs/images/ONF_Faucet_deploy1.png
-
+.. image:: docs/images/faucet-architecture.png
 
 Faucet Deployment around the World
 ----------------------------------
@@ -261,12 +253,12 @@ As of Faucet v1.3 release, ACL table is now Table 0 so that actions like port mi
 
 ::
 
-    PACKETS IN                  +-------------------------+ +-------------------------+
-      +                         |                         | |                         |
-      |                         |                         | |        CONTROLLER       |
-      |                         |                         | |            ^            |
-      |                         |                         v |       +----+-----+      v
-      |     +----------+  +-----+----+  +----------+  +---+-+----+  |4:IPv4_FIB|  +---+------+  +----------+
+    PACKETS IN                  +---------------------------+
+      +                         |                           |
+      |                         |                           |        CONTROLLER
+      |                         |                           |             ^
+      |                         |                           v       +-----+----+
+      |     +----------+  +-----+----+  +----------+  +-----+----+  |4:IPv4_FIB|  +----------+  +----------+
       |     |0:PORT_ACL|  |1:VLAN    |  |2:VLAN_ACL|  |3:ETH_SRC +->+          +->+6:ETH_DST |  |7:FLOOD   |
       +---->+          |  |          |  |          |  |          |  |          |  |          |  |          |
             |          |  |          |  |          |  |          |  +----------+  |          |  |          |
@@ -276,10 +268,10 @@ As of Faucet v1.3 release, ACL table is now Table 0 so that actions like port mi
             |          |  |          |  |          |  |          |  +----------+  |          |  |          |
             |          |  |          |  |          |  |          |  |5:IPv6_FIB|  |          |  |          |
             |          |  |          |  |          |  |          +->+          +->+          |  |          |
-            +----------+  +----------+  +----------+  +----+-----+  |          |  +------+---+  +--+-------+
-                                                           |        +----+-----+         |         |
-                                                           v             v               v         v
-                                                        CONTROLLER    CONTROLLER          PACKETS OUT
+            +----------+  +----------+  +----------+  +-----+----+  |          |  +------+---+  +--+-------+
+                                                            |       +-----+----+         |         |
+                                                            v             v              v         v
+                                                       CONTROLLER    CONTROLLER          PACKETS OUT
 
 =======
 Running
@@ -299,25 +291,7 @@ Run with ``ryu-manager`` (uses ``/etc/ryu/faucet/faucet.yaml`` as configuration 
     # export GAUGE_EXCEPTION_LOG=/var/log/faucet/gauge_exception.log
     # export GAUGE_DB_CONFIG=/etc/ryu/faucet/gauge_db.yaml
     # $EDITOR /etc/ryu/faucet/faucet.yaml
-    # ryu-manager --verbose faucet.py
-
-To find the location of ``faucet.py``, run ``pip show ryu-faucet`` to get the Location Path.  Then run:
-
-.. code:: bash
-
-    # ryu-manager --verbose <Location_Path>/ryu_faucet/org/onfsdn/faucet/faucet.py
-
-Alternatively, if OF Controller is using a non-default port of 6633, for example 6653, then:
-
-.. code:: bash
-
-    # ryu-manager --verbose  --ofp-tcp-listen-port 6653 <Location_Path>/ryu_faucet/org/onfsdn/faucet/faucet.py
-
-On Mac OS X, for example, one would run this as:
-
-.. code:: bash
-
-    # ryu-manager --verbose /opt/local/Library/Frameworks/Python.framework/Versions/2.7/lib/python2.7/site-packages/ryu_faucet/org/onfsdn/faucet/faucet.py
+    # ryu-manager --verbose faucet.faucet
 
 To specify a different configuration file set the ``FAUCET_CONFIG`` environment variable.
 
@@ -331,7 +305,7 @@ To tell Faucet to reload its configuration file after you've changed it, simply 
 
 .. code:: bash
 
-  pkill -SIGHUP -f "ryu-manager faucet.py"
+  pkill -SIGHUP -f "ryu-manager faucet.faucet"
 
 =======
 Testing
@@ -344,7 +318,7 @@ Mininet test actually spins up virtual hosts and a switch, and a test FAUCET con
 
 .. code:: bash
 
-  git clone https://github.com/onfsdn/faucet
+  git clone https://github.com/REANNZ/faucet
   cd faucet/tests
   # (As namespace, etc needs to be setup, run the next command as root)
   sudo ./faucet_mininet_test.py
@@ -353,10 +327,10 @@ Mininet test actually spins up virtual hosts and a switch, and a test FAUCET con
 Working with Real Hardware
 --------------------------
 
-If you are a hardware vendor wanting to support FAUCET, you need to support all the matches in src/ryu_faucet/org/onfsdn/faucet/valve.py:valve_in_match().
+If you are a hardware vendor wanting to support FAUCET, you need to support all the matches in `faucet/valve.py <faucet/valve.py>`_ valve_in_match().
 
 Faucet has been tested against the following switches:
-(Hint: look at src/ryu_faucet/org/onfsdn/faucet/dp.py to add your switch)
+(Hint: look at `faucet/dp.py <faucet/dp.py>`_ to add your switch)
 
 1. `Open vSwitch v2.1+ <http://www.openvswitch.org>`_
 2. `Lagopus Openflow Switch <https://lagopus.github.io>`_
@@ -369,17 +343,18 @@ Faucet has been tested against the following switches:
 Faucet's design principle is to be as hardware agnostic as possible and not require Table Type Patterns. This means that Faucet expects the hardware Open Flow Agent (OFA) to hide implementation details, including which tables are best for certain matches or whether there is special support for multicast - Faucet expects the OFA to leverage the right hardware transparently.
 
 ============================================================
-Buying and running commercial switches supporting ryu-faucet
+Buying and running commercial switches supporting faucet
 ============================================================
 
-Guides for getting up and running with Faucet on vendor hardware are provided in the `docs/vendors <src/docs/vendors>`_ directory.
+Guides for getting up and running with Faucet on vendor hardware are provided in the `docs/vendors <docs/vendors>`_ directory.
 
 Allied Telesis
 --------------
 
 `Allied Telesis <http://www.alliedtelesis.com/sdn>`_ sells their products via distributors and resellers. To order in USA call `ProVantage <http://www.provantage.com/allied-telesis-splx10~7ALL912L.htm>`_. To find a sales office near you, visit `Allied Telesis <http://www.AlliedTelesis.com>`_
 
-* On Allied Telesis, all vlans must be included in the vlan database config on the switch before they can be used by OpenFlow.  When ordering, request Openflow license SKU.
+* On Allied Telesis, starting from latest software version 5.4.7, all data VLANs are automatically created on the switch.
+* When ordering, request Openflow switch SKU.
 
 NorthBound Networks
 -------------------
@@ -414,13 +389,11 @@ Gauge is run with ``ryu-manager``:
 .. code:: bash
 
   $EDITOR /etc/ryu/faucet/gauge.yaml
-  ryu-manager gauge.py
+  ryu-manager faucet.gauge
 
 Screenshots
 -----------
-.. image:: src/docs/images/faucet-snapshot1.png
-.. image:: src/docs/images/faucet-snapshot2.png
-.. image:: src/docs/images/faucet-snapshot3.png
+.. image:: docs/images/gauge-nznog17.png
 
 =======
 Support
@@ -432,7 +405,7 @@ We run a number of mailing lists for communication between users and developers 
 - https://list.waikato.ac.nz/mailman/listinfo/faucet-dev
 - https://lists.geant.org/sympa/info/faucet-users
 
-Additional documentation is available under the `docs <src/docs>`_ directory.
+Additional documentation is available under the `docs <docs>`_ directory.
 
 Faucet blog by Josh Bailey available at http://faucet-sdn.blogspot.co.nz.
 
